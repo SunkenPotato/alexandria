@@ -38,6 +38,7 @@ impl Span {
 }
 
 /// A spanned item.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Spanned<T> {
     pub item: T,
     pub span: Span,

@@ -1,64 +1,46 @@
-use std::ops::{Deref, DerefMut};
+pub mod stream;
+
+use span::source::{SourceIdx, SourceMap};
+
+pub use internment::Intern;
+
+use crate::stream::TokenStream;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Span {
-    start: u32,
-    stop: u32,
+pub enum TokenKind {}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub symbol: Intern<str>,
 }
 
-impl Span {
-    pub const fn new(start: u32, stop: u32) -> Self {
-        debug_assert!(stop >= start);
-        Self { start, stop }
-    }
-
-    pub const fn start(&self) -> u32 {
-        self.start
-    }
-
-    pub const fn stop(&self) -> u32 {
-        self.stop
-    }
-
-    pub const fn extend(mut self, other: Self) -> Self {
-        debug_assert!(other.stop >= self.stop);
-
-        self.stop = other.stop;
-        self
-    }
-}
-
-pub struct Spanned<T> {
-    pub t: T,
-    pub span: Span,
-}
-
-impl<T> Spanned<T> {
-    pub const fn new(span: Span, t: T) -> Self {
-        Self { t, span }
-    }
-
-    pub fn map<F, U>(self, f: F) -> Spanned<U>
+impl Token {
+    pub fn new<T>(kind: TokenKind, symbol: T) -> Self
     where
-        F: FnOnce(T) -> U,
+        Intern<str>: From<T>,
     {
-        Spanned {
-            t: f(self.t),
-            span: self.span,
+        Self {
+            kind,
+            symbol: Intern::from(symbol),
         }
     }
 }
 
-impl<T> Deref for Spanned<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.t
-    }
+pub struct Lexer<'s> {
+    pub source_idx: SourceIdx,
+    pub source_map: &'s SourceMap,
 }
 
-impl<T> DerefMut for Spanned<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.t
+impl<'s> Lexer<'s> {
+    pub const fn new(source_idx: SourceIdx, source_map: &'s SourceMap) -> Self {
+        Self {
+            source_idx,
+            source_map,
+        }
+    }
+
+    pub fn lex(self) -> TokenStream {
+        todo!()
     }
 }
