@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["alexandria",  "lexer", "span"]
+members = ["alexandria", "diagnostic",  "lexer", "parser", "span"]

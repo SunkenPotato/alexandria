@@ -6,6 +6,11 @@
 
 pub mod source;
 
+const _ASSERT_USIZE_GREATER_THAN_U32: () = assert!(
+    u32::BITS <= usize::BITS,
+    "The compiler needs at least 32-bit wide integers."
+);
+
 /// A source region.
 ///
 /// A [`Span`] is a reference to a region of source code. It does not actually contain the source code, but is rather a pointer to it.
