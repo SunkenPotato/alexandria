@@ -1,7 +1,7 @@
 pub mod expr;
 
 use diagnostic::Diagnostics;
-use lexer::{Token, TokenKind, stream::TokenStream};
+use lexer::{Intern, Token, TokenKind, stream::TokenStream};
 use span::{Span, Spanned, source::SourceIdx};
 
 pub type ParseResult<T> = std::result::Result<T, ParseError>;
@@ -118,6 +118,72 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
 
         Ok(Spanned::new(span, result))
     }
+
+    pub fn with<F, T>(&mut self, f: F) -> ParseResult<T>
+    where
+        for<'d2, 's2, 'i2> F: FnOnce(ParseGuard<'d2, 's2, 'i2>) -> ParseResult<T>,
+    {
+        let mut index = *self.index;
+        let guard = ParseGuard {
+            diagnostics: self.diagnostics,
+            committed: index,
+            index: &mut index,
+            stream: self.stream,
+        };
+
+        let result = f(guard)?;
+        *self.index = index;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Path {
+    segments: Vec<Spanned<Intern<str>>>,
+    is_fully_qualified: bool,
+}
+
+impl Path {
+    pub fn single(val: Spanned<Intern<str>>) -> Self {
+        Self {
+            segments: vec![val],
+            is_fully_qualified: false,
+        }
+    }
+}
+
+impl Parse for Path {
+    fn is_ok(&self) -> bool {
+        true
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        mut guard: ParseGuard<'diag, 'source, 'index>,
+    ) -> ParseResult<Self> {
+        // using spanning so that it's atomic
+        let is_fully_qualified = guard.spanning(consume_double_colon).is_ok();
+        let mut segments = vec![guard.next_require(TokenKind::Ident)?.map(|x| x.symbol)];
+
+        loop {
+            if guard.spanning(consume_double_colon).is_err() {
+                break;
+            }
+
+            segments.push(guard.next_require(TokenKind::Ident)?.map(|x| x.symbol));
+        }
+
+        Ok(Self {
+            segments,
+            is_fully_qualified,
+        })
+    }
+}
+
+fn consume_double_colon(mut guard: ParseGuard) -> ParseResult<Spanned<()>> {
+    guard
+        .next_require(TokenKind::Colon)
+        .and_then(|_| guard.next_require(TokenKind::Colon))
+        .map(|x| x.map(|_| ()))
 }
 
 pub trait Parse: Sized {
@@ -153,6 +219,8 @@ where
         }
     };
 
+    dbg!(&tokens);
+
     let mut parser = Parser::new(&tokens, &mut diagnostics);
     let parsed = match parser.parse::<T>() {
         Ok(v) => v,
@@ -164,4 +232,57 @@ where
     };
 
     assert_eq!(other, parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use lexer::Intern;
+    use span::{Span, Spanned};
+
+    use crate::{Path, assert_eq};
+
+    #[test]
+    fn parse_fq_path() {
+        assert_eq(
+            "::std::io",
+            Spanned::new(
+                Span::new(0, 9),
+                Path {
+                    is_fully_qualified: true,
+                    segments: vec![
+                        Spanned::new(Span::new(2, 5), Intern::from("std")),
+                        Spanned::new(Span::new(7, 9), Intern::from("io")),
+                    ],
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn parse_path() {
+        assert_eq(
+            "std::io",
+            Spanned::new(
+                Span::new(0, 7),
+                Path {
+                    is_fully_qualified: false,
+                    segments: vec![
+                        Spanned::new(Span::new(0, 3), Intern::from("std")),
+                        Spanned::new(Span::new(5, 7), Intern::from("io")),
+                    ],
+                },
+            ),
+        )
+    }
+
+    #[test]
+    fn parse_single_path() {
+        assert_eq(
+            "tmp",
+            Spanned::new(
+                Span::new(0, 3),
+                Path::single(Spanned::new(Span::new(0, 3), Intern::from("tmp"))),
+            ),
+        );
+    }
 }

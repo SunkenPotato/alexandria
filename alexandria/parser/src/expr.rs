@@ -1,3 +1,29 @@
+use crate::{Parse, Path, expr::literal::Literal};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BaseExpr {
+    Literal(Literal),
+    Path(Path),
+}
+
+impl Parse for BaseExpr {
+    fn is_ok(&self) -> bool {
+        match self {
+            Self::Literal(v) => v.is_ok(),
+            Self::Path(v) => v.is_ok(),
+        }
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        mut guard: crate::ParseGuard<'diag, 'source, 'index>,
+    ) -> crate::ParseResult<Self> {
+        guard
+            .with(Literal::parse)
+            .map(Self::Literal)
+            .or_else(|_| guard.with(Path::parse).map(Self::Path))
+    }
+}
+
 mod literal {
     use diagnostic::Diagnostic;
     use lexer::{Intern, TokenKind};
