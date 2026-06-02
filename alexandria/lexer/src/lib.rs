@@ -195,6 +195,7 @@ impl<'s, 'd> Lexer<'s, 'd> {
         while let Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_') = self.next() {}
     }
 
+    #[expect(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<char> {
         self.iter.next().inspect(|_| self.cursor.next())
     }
@@ -213,6 +214,7 @@ impl<'s, 'd> Lexer<'s, 'd> {
     }
 }
 
+#[derive(Default)]
 pub struct Cursor {
     cursor: usize,
     committed: usize,

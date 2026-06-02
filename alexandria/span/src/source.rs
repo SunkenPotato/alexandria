@@ -131,7 +131,7 @@ impl SourceFile {
                 .get(v.saturating_sub(1))
                 .copied()
                 .unwrap_or(span.start),
-            Err(e) => self.newlines[e],
+            Err(e) => self.newlines.get(e).copied().unwrap_or_default(),
         };
 
         let stop = match self.newlines.binary_search(&span.stop) {
@@ -140,7 +140,7 @@ impl SourceFile {
                 .get(v.saturating_add(1))
                 .copied()
                 .unwrap_or(span.stop),
-            Err(e) => self.newlines[e],
+            Err(e) => self.newlines.get(e).copied().unwrap_or_default(),
         };
 
         self.region(Span::new(start, stop))
@@ -153,7 +153,7 @@ impl SourceFile {
             Err(e) => e,
         } + 1;
 
-        let column = pos - self.newlines[line - 1];
+        let column = pos - self.newlines.get(line - 1).copied().unwrap_or_default();
         Some(LineCol {
             line: line as u32,
             column,

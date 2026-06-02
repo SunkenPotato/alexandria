@@ -2,14 +2,15 @@ pub mod expr;
 
 use diagnostic::Diagnostics;
 use lexer::{Token, TokenKind, stream::TokenStream};
-use span::{Spanned, source::SourceIdx};
+use span::{Span, Spanned, source::SourceIdx};
 
 pub type ParseResult<T> = std::result::Result<T, ParseError>;
 
 #[derive(Clone, Debug)]
 pub enum ParseError {
     Eof,
-    TokenMismatch(Spanned<TokenKind>),
+    // TODO: replace with smallvec or something
+    TokenMismatch(Vec<TokenKind>, Span),
 }
 
 pub struct Parser<'s, 'd> {
@@ -76,7 +77,7 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
                 *self.index += 1;
                 Ok(*v)
             }
-            Some(v) => Err(ParseError::TokenMismatch(Spanned::new(v.span, v.item.kind))),
+            Some(v) => Err(ParseError::TokenMismatch(vec![v.item.kind], v.span)),
             None => Err(ParseError::Eof),
         }
     }
@@ -84,7 +85,7 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
     pub fn peek_require(&self, kind: TokenKind) -> ParseResult<Spanned<Token>> {
         match self.stream.get(*self.index) {
             Some(v) if v.item.kind == kind => Ok(*v),
-            Some(v) => Err(ParseError::TokenMismatch(Spanned::new(v.span, v.item.kind))),
+            Some(v) => Err(ParseError::TokenMismatch(vec![v.item.kind], v.span)),
             None => Err(ParseError::Eof),
         }
     }
@@ -108,10 +109,7 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
             stream: self.stream,
         };
 
-        let result = match f(guard) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        let result = f(guard)?;
 
         let span = self.stream[*self.index..index]
             .iter()
@@ -129,4 +127,41 @@ pub trait Parse: Sized {
 
     /// Specify which state of this can be interpreted as a successfully parsed element.
     fn is_ok(&self) -> bool;
+}
+
+#[cfg(test)]
+#[track_caller]
+fn assert_eq<T>(input: impl Into<String>, other: Spanned<T>)
+where
+    T: Parse + PartialEq + std::fmt::Debug,
+{
+    use lexer::Lexer;
+    use span::source::{SourceFile, SourceMap};
+
+    let mut sources = SourceMap::new();
+    let source_file = SourceFile::from_memory(input.into());
+    let source_idx = sources.insert(source_file);
+    let mut diagnostics = Diagnostics::new(source_idx);
+
+    let lexer = Lexer::new(&sources, source_idx, &mut diagnostics);
+    let tokens = match lexer.lex() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("Input failed to lex. Diagnostics: ");
+            diagnostics.write_stderr(&sources).unwrap();
+            panic!();
+        }
+    };
+
+    let mut parser = Parser::new(&tokens, &mut diagnostics);
+    let parsed = match parser.parse::<T>() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Failed to parse tokens. Error: {e:#?}. Diagnostics: ");
+            diagnostics.write_stderr(&sources).unwrap();
+            panic!();
+        }
+    };
+
+    assert_eq!(other, parsed)
 }
