@@ -192,7 +192,9 @@ impl<'s, 'd> Lexer<'s, 'd> {
     }
 
     fn lex_ident(&mut self) {
-        while let Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_') = self.next() {}
+        while let Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_') = self.peek() {
+            _ = self.next();
+        }
     }
 
     #[expect(clippy::should_implement_trait)]
@@ -210,6 +212,7 @@ impl<'s, 'd> Lexer<'s, 'd> {
         let symbol = &self.source[start..stop];
         let span = Span::new(start as u32, stop as u32);
 
+        self.cursor.commit();
         Spanned::new(span, Token::new(kind, symbol))
     }
 }

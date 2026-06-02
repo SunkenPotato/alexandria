@@ -10,6 +10,7 @@ pub enum StreamError {
     KindMismatch(TokenKind),
 }
 
+#[derive(Debug, Clone)]
 pub struct TokenStream {
     pub source_idx: SourceIdx,
     pub tokens: Vec<Spanned<Token>>,
