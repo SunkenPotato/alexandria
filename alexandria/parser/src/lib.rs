@@ -97,9 +97,9 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
         }
     }
 
-    pub fn spanning<F, T>(&mut self, f: F) -> ParseResult<Spanned<T>>
+    pub fn spanning<F, T, E>(&mut self, f: F) -> Result<Spanned<T>, E>
     where
-        for<'d2, 's2, 'i2> F: FnOnce(ParseGuard<'d2, 's2, 'i2>) -> ParseResult<T>,
+        for<'d2, 's2, 'i2> F: FnOnce(ParseGuard<'d2, 's2, 'i2>) -> Result<T, E>,
     {
         let mut index = *self.index;
         let guard = ParseGuard {
@@ -219,8 +219,6 @@ where
         }
     };
 
-    dbg!(&tokens);
-
     let mut parser = Parser::new(&tokens, &mut diagnostics);
     let parsed = match parser.parse::<T>() {
         Ok(v) => v,
@@ -231,7 +229,7 @@ where
         }
     };
 
-    assert_eq!(other, parsed)
+    pretty_assertions::assert_eq!(other, parsed)
 }
 
 #[cfg(test)]

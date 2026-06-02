@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 diagnostic = { version = "0.1.0", path = "../diagnostic" }
 lexer = { version = "0.1.0", path = "../lexer" }
+pretty_assertions = "1.4.1"
 span = { version = "0.1.0", path = "../span" }

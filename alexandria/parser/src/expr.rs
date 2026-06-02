@@ -1,4 +1,181 @@
-use crate::{Parse, Path, expr::literal::Literal};
+use lexer::TokenKind;
+use span::{Span, Spanned};
+
+use crate::{Parse, ParseError, ParseGuard, ParseResult, Path, expr::literal::Literal};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Binary(BinaryExpr),
+    Base(BaseExpr),
+}
+
+impl Parse for Expr {
+    fn is_ok(&self) -> bool {
+        match self {
+            Expr::Base(base) => base.is_ok(),
+            Expr::Binary(binary) => {
+                binary.lhs.item.is_ok() && binary.op.item.is_ok() && binary.rhs.item.is_ok()
+            }
+        }
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        guard: ParseGuard<'diag, 'source, 'index>,
+    ) -> ParseResult<Self> {
+        Self::parse_1(guard, 0)
+    }
+}
+impl Expr {
+    fn parse_1(mut guard: ParseGuard, precedence: u8) -> ParseResult<Self> {
+        let mut base = guard.spanning(BaseExpr::parse)?.map(Self::Base);
+
+        while let Ok(op) = guard.spanning(|guard| match BinaryOp::parse(guard) {
+            Ok(v) if v.precedence() > precedence => Ok(v),
+            Ok(_) | Err(_) => Err(()),
+        }) {
+            let rhs = guard.spanning(|g| Self::parse_1(g, op.item.precedence()))?;
+
+            base = Spanned::new(
+                Span::new(base.span.start(), rhs.span.stop()),
+                Self::Binary(BinaryExpr {
+                    lhs: Box::new(base),
+                    op,
+                    rhs: Box::new(rhs),
+                }),
+            );
+        }
+
+        Ok(base.item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinaryExpr {
+    pub lhs: Box<Spanned<Expr>>,
+    pub op: Spanned<BinaryOp>,
+    pub rhs: Box<Spanned<Expr>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    Shr,
+    Shl,
+    And,
+    Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+}
+
+impl Parse for BinaryOp {
+    fn is_ok(&self) -> bool {
+        true
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        mut guard: crate::ParseGuard<'diag, 'source, 'index>,
+    ) -> crate::ParseResult<Self> {
+        let next = guard.next()?;
+        let op = match next.item.kind {
+            TokenKind::Plus => Self::Add,
+            TokenKind::Minus => Self::Sub,
+            TokenKind::Asterisk => Self::Mul,
+            TokenKind::Slash => Self::Div,
+            TokenKind::Percent => Self::Rem,
+            TokenKind::Equal => {
+                guard.next_require(TokenKind::Equal)?;
+                Self::Eq
+            }
+            TokenKind::Bang => {
+                guard.next_require(TokenKind::Equal)?;
+                Self::NotEq
+            }
+            TokenKind::LessThan => {
+                if guard.next_require(TokenKind::LessThan).is_ok() {
+                    Self::Shl
+                } else if guard.next_require(TokenKind::Equal).is_ok() {
+                    Self::Le
+                } else {
+                    Self::Lt
+                }
+            }
+            TokenKind::GreaterThan => {
+                if guard.next_require(TokenKind::GreaterThan).is_ok() {
+                    Self::Shr
+                } else if guard.next_require(TokenKind::Equal).is_ok() {
+                    Self::Ge
+                } else {
+                    Self::Gt
+                }
+            }
+            TokenKind::Ampersand => {
+                if guard.next_require(TokenKind::Ampersand).is_ok() {
+                    Self::And
+                } else {
+                    Self::BitAnd
+                }
+            }
+            TokenKind::Pipe => {
+                if guard.next_require(TokenKind::Pipe).is_ok() {
+                    Self::Or
+                } else {
+                    Self::BitOr
+                }
+            }
+            TokenKind::Caret => Self::BitXor,
+            _ => {
+                return Err(ParseError::TokenMismatch(
+                    vec![
+                        TokenKind::Plus,
+                        TokenKind::Minus,
+                        TokenKind::Asterisk,
+                        TokenKind::Slash,
+                        TokenKind::Percent,
+                        TokenKind::Equal,
+                        TokenKind::Bang,
+                        TokenKind::LessThan,
+                        TokenKind::GreaterThan,
+                        TokenKind::Ampersand,
+                        TokenKind::Pipe,
+                        TokenKind::Caret,
+                    ],
+                    next.span,
+                ));
+            }
+        };
+
+        Ok(op)
+    }
+}
+
+impl BinaryOp {
+    pub const fn precedence(&self) -> u8 {
+        match self {
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::And
+            | BinaryOp::BitAnd
+            | BinaryOp::Or
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor => 10,
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Ge | BinaryOp::Gt => 20,
+            BinaryOp::Shr | BinaryOp::Shl => 30,
+            BinaryOp::Add | BinaryOp::Sub => 40,
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => 50,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BaseExpr {
@@ -167,7 +344,10 @@ mod tests {
 
     use crate::{
         assert_eq,
-        expr::literal::{IntegerLiteral, Literal, StringLiteral},
+        expr::{
+            BaseExpr, BinaryExpr, BinaryOp, Expr,
+            literal::{IntegerLiteral, Literal, StringLiteral},
+        },
     };
 
     #[test]
@@ -204,6 +384,82 @@ mod tests {
         assert_eq(
             r#""\x\{0001}""#,
             Spanned::new(Span::new(0, 11), Literal::Str(StringLiteral::InvalidEsc)),
+        )
+    }
+
+    #[test]
+    fn parse_simple_bin_expr() {
+        assert_eq(
+            "2 + 2",
+            Spanned::new(
+                Span::new(0, 5),
+                Expr::Binary(BinaryExpr {
+                    lhs: Box::new(Spanned::new(
+                        Span::new(0, 1),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2)))),
+                    )),
+                    op: Spanned::new(Span::new(2, 3), BinaryOp::Add),
+                    rhs: Box::new(Spanned::new(
+                        Span::new(4, 5),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2)))),
+                    )),
+                }),
+            ),
+        );
+    }
+
+    #[test]
+    fn parse_complex_bin_expr() {
+        assert_eq(
+            "4 - 11 % 7 == 16 >> 4",
+            Spanned::new(
+                Span::new(0, 21),
+                Expr::Binary(BinaryExpr {
+                    lhs: Box::new(Spanned::new(
+                        Span::new(0, 10),
+                        Expr::Binary(BinaryExpr {
+                            lhs: Box::new(Spanned::new(
+                                Span::new(0, 1),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(4)))),
+                            )),
+                            op: Spanned::new(Span::new(2, 3), BinaryOp::Sub),
+                            rhs: Box::new(Spanned::new(
+                                Span::new(4, 10),
+                                Expr::Binary(BinaryExpr {
+                                    lhs: Box::new(Spanned::new(
+                                        Span::new(4, 6),
+                                        Expr::Base(BaseExpr::Literal(Literal::Int(
+                                            IntegerLiteral::Ok(11),
+                                        ))),
+                                    )),
+                                    op: Spanned::new(Span::new(7, 8), BinaryOp::Rem),
+                                    rhs: Box::new(Spanned::new(
+                                        Span::new(9, 10),
+                                        Expr::Base(BaseExpr::Literal(Literal::Int(
+                                            IntegerLiteral::Ok(7),
+                                        ))),
+                                    )),
+                                }),
+                            )),
+                        }),
+                    )),
+                    op: Spanned::new(Span::new(11, 13), BinaryOp::Eq),
+                    rhs: Box::new(Spanned::new(
+                        Span::new(14, 21),
+                        Expr::Binary(BinaryExpr {
+                            lhs: Box::new(Spanned::new(
+                                Span::new(14, 16),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(16)))),
+                            )),
+                            op: Spanned::new(Span::new(17, 19), BinaryOp::Shr),
+                            rhs: Box::new(Spanned::new(
+                                Span::new(20, 21),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(4)))),
+                            )),
+                        }),
+                    )),
+                }),
+            ),
         )
     }
 }

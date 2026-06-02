@@ -34,6 +34,7 @@ pub enum TokenKind {
     Dot,
     Question,
     Tilde,
+    Percent,
     LBracket,
     RBracket,
     Pipe,
@@ -116,6 +117,7 @@ impl<'s, 'd> Lexer<'s, 'd> {
                 '[' => LBracket,
                 ']' => RBracket,
                 '|' => Pipe,
+                '%' => Percent,
                 '0'..='9' => {
                     self.lex_int();
                     Integer
