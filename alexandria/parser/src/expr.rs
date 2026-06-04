@@ -188,6 +188,8 @@ pub enum BaseExpr {
     Literal(Literal),
     Path(Path),
     Block(Block),
+    FnCall(FnCall),
+    Parenthesized(Box<Expr>),
 }
 
 impl Parse for BaseExpr {
@@ -196,17 +198,48 @@ impl Parse for BaseExpr {
             Self::Literal(v) => v.is_ok(),
             Self::Path(v) => v.is_ok(),
             Self::Block(v) => v.is_ok(),
+            Self::FnCall(v) => v.object.item.is_ok() && v.args.iter().all(|x| x.item.is_ok()),
+            Self::Parenthesized(v) => v.is_ok(),
         }
     }
 
     fn parse<'diag, 'source, 'index>(
         mut guard: crate::ParseGuard<'diag, 'source, 'index>,
     ) -> crate::ParseResult<Self> {
-        guard
-            .with(Literal::parse)
-            .map(Self::Literal)
-            .or_else(|_| guard.with(Path::parse).map(Self::Path))
-            .or_else(|_| guard.with(Block::parse).map(Self::Block))
+        if guard.next_require(TokenKind::LParen).is_ok() {
+            let expr = Box::new(guard.with(Expr::parse)?);
+            guard.next_require(TokenKind::RParen)?;
+            Ok(Self::Parenthesized(expr))
+        } else {
+            let object = Box::new(
+                guard
+                    .spanning(Literal::parse)
+                    .map(|x| x.map(Self::Literal))
+                    .or_else(|_| guard.spanning(Path::parse).map(|x| x.map(Self::Path)))
+                    .or_else(|_| guard.spanning(Block::parse).map(|x| x.map(Self::Block)))?,
+            );
+
+            if guard.next_require(TokenKind::LParen).is_ok() {
+                let mut args = vec![];
+
+                while let Ok(arg) = guard.spanning(Expr::parse) {
+                    args.push(arg);
+                    if guard.next_require(TokenKind::Comma).is_ok() {
+                        if guard.next_require(TokenKind::RParen).is_ok() {
+                            break;
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        guard.next_require(TokenKind::RParen)?;
+                    }
+                }
+
+                Ok(Self::FnCall(FnCall { object, args }))
+            } else {
+                Ok(object.item)
+            }
+        }
     }
 }
 
@@ -395,6 +428,12 @@ impl Parse for Block {
     }
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub struct FnCall {
+    pub object: Box<Spanned<BaseExpr>>,
+    pub args: Vec<Spanned<Expr>>,
+}
+
 // --- tests ---
 #[cfg(test)]
 mod tests {
@@ -404,7 +443,7 @@ mod tests {
     use crate::{
         Path, assert_eq,
         expr::{
-            BaseExpr, BinaryExpr, BinaryOp, Block, Expr,
+            BaseExpr, BinaryExpr, BinaryOp, Block, Expr, FnCall,
             literal::{IntegerLiteral, Literal, StringLiteral},
         },
         stmt::{Binding, Stmt},
@@ -564,5 +603,47 @@ mod tests {
                 })),
             ),
         );
+    }
+
+    #[test]
+    fn parse_parenthesized() {
+        assert_eq(
+            "(5)",
+            Spanned::new(
+                Span::new(0, 3),
+                Expr::Base(BaseExpr::Parenthesized(Box::new(Expr::Base(
+                    BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5))),
+                )))),
+            ),
+        );
+    }
+
+    #[test]
+    fn parse_fn_call() {
+        assert_eq(
+            "add(2, 2)",
+            Spanned::new(
+                Span::new(0, 9),
+                Expr::Base(BaseExpr::FnCall(FnCall {
+                    object: Box::new(Spanned::new(
+                        Span::new(0, 3),
+                        BaseExpr::Path(Path::single(Spanned::new(
+                            Span::new(0, 3),
+                            Intern::from("add"),
+                        ))),
+                    )),
+                    args: vec![
+                        Spanned::new(
+                            Span::new(4, 5),
+                            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2)))),
+                        ),
+                        Spanned::new(
+                            Span::new(7, 8),
+                            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2)))),
+                        ),
+                    ],
+                })),
+            ),
+        )
     }
 }
