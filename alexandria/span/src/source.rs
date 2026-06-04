@@ -126,21 +126,18 @@ impl SourceFile {
 
     pub fn context(&self, span: Span) -> Option<&str> {
         let start = match self.newlines.binary_search(&span.start) {
-            Ok(v) => self
+            Ok(v) => self.newlines.get(v.saturating_sub(1)).copied().unwrap_or(0),
+            Err(e) => self
                 .newlines
-                .get(v.saturating_sub(1))
+                .get(e.saturating_sub(1))
                 .copied()
-                .unwrap_or(span.start),
-            Err(e) => self.newlines.get(e).copied().unwrap_or_default(),
+                .map(|v| v + 1)
+                .unwrap_or(0),
         };
 
         let stop = match self.newlines.binary_search(&span.stop) {
-            Ok(v) => self
-                .newlines
-                .get(v.saturating_add(1))
-                .copied()
-                .unwrap_or(span.stop),
-            Err(e) => self.newlines.get(e).copied().unwrap_or_default(),
+            Ok(v) => self.newlines.get(v + 1).copied().unwrap_or(span.stop),
+            Err(e) => self.newlines.get(e).copied().unwrap_or(span.stop),
         };
 
         self.region(Span::new(start, stop))
@@ -153,7 +150,14 @@ impl SourceFile {
             Err(e) => e,
         } + 1;
 
-        let column = pos - self.newlines.get(line - 1).copied().unwrap_or_default();
+        let column = pos
+            - self
+                .newlines
+                .get(line - 1)
+                .copied()
+                .map(|nl| nl + 1)
+                .unwrap_or(0);
+
         Some(LineCol {
             line: line as u32,
             column,

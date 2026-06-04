@@ -1,7 +1,12 @@
+use diagnostic::Diagnostic;
 use lexer::TokenKind;
 use span::{Span, Spanned};
 
-use crate::{Parse, ParseError, ParseGuard, ParseResult, Path, expr::literal::Literal};
+use crate::{
+    Parse, ParseError, ParseGuard, ParseResult, Path,
+    expr::literal::Literal,
+    stmt::{Binding, Stmt},
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -25,6 +30,7 @@ impl Parse for Expr {
         Self::parse_1(guard, 0)
     }
 }
+
 impl Expr {
     fn parse_1(mut guard: ParseGuard, precedence: u8) -> ParseResult<Self> {
         let mut base = guard.spanning(BaseExpr::parse)?.map(Self::Base);
@@ -136,7 +142,7 @@ impl Parse for BinaryOp {
             TokenKind::Caret => Self::BitXor,
             _ => {
                 return Err(ParseError::TokenMismatch(
-                    vec![
+                    smallvec::smallvec![
                         TokenKind::Plus,
                         TokenKind::Minus,
                         TokenKind::Asterisk,
@@ -181,6 +187,7 @@ impl BinaryOp {
 pub enum BaseExpr {
     Literal(Literal),
     Path(Path),
+    Block(Block),
 }
 
 impl Parse for BaseExpr {
@@ -188,6 +195,7 @@ impl Parse for BaseExpr {
         match self {
             Self::Literal(v) => v.is_ok(),
             Self::Path(v) => v.is_ok(),
+            Self::Block(v) => v.is_ok(),
         }
     }
 
@@ -198,10 +206,11 @@ impl Parse for BaseExpr {
             .with(Literal::parse)
             .map(Self::Literal)
             .or_else(|_| guard.with(Path::parse).map(Self::Path))
+            .or_else(|_| guard.with(Block::parse).map(Self::Block))
     }
 }
 
-mod literal {
+pub mod literal {
     use diagnostic::Diagnostic;
     use lexer::{Intern, TokenKind};
     use span::Span;
@@ -230,7 +239,7 @@ mod literal {
                 TokenKind::Integer => Ok(Self::Int(IntegerLiteral::parse(guard)?)),
                 TokenKind::StringLit => Ok(Self::Str(StringLiteral::parse(guard)?)),
                 _ => Err(ParseError::TokenMismatch(
-                    vec![TokenKind::Integer, TokenKind::StringLit],
+                    smallvec::smallvec![TokenKind::Integer, TokenKind::StringLit],
                     next.span,
                 )),
             }
@@ -336,6 +345,56 @@ mod literal {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct Block {
+    pub stmts: Vec<Spanned<Stmt>>,
+    pub tail: Option<Box<Spanned<Expr>>>,
+}
+
+impl Parse for Block {
+    fn is_ok(&self) -> bool {
+        self.stmts.iter().all(|x| x.item.is_ok())
+            && self.tail.as_ref().is_some_and(|x| x.item.is_ok())
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        mut guard: ParseGuard<'diag, 'source, 'index>,
+    ) -> ParseResult<Self> {
+        let opening = guard.next_require(TokenKind::LCurly)?;
+        let mut stmts = vec![];
+        loop {
+            if let Ok(b) = guard.spanning(Binding::parse) {
+                stmts.push(b.map(Stmt::Binding));
+                continue;
+            }
+
+            let mut expr = guard.spanning(Expr::parse)?;
+            if let Ok(v) = guard.next_require(TokenKind::Semicolon) {
+                expr.span = expr.span.extend(v.span);
+                stmts.push(expr.map(Stmt::ExprSemi));
+                continue;
+            }
+
+            if let Err(e) = guard.next_require(TokenKind::RCurly) {
+                guard.diagnostics.push(
+                    Diagnostic::error(
+                        Span::new(expr.span.stop() - 1, expr.span.stop()),
+                        "expected closing delimiter ('}') here",
+                        Some("add a '}' here".to_owned()),
+                    )
+                    .with_secondary(opening.span),
+                );
+                return Err(e);
+            }
+
+            return Ok(Self {
+                stmts,
+                tail: Some(Box::new(expr)),
+            });
+        }
+    }
+}
+
 // --- tests ---
 #[cfg(test)]
 mod tests {
@@ -343,11 +402,12 @@ mod tests {
     use span::{Span, Spanned};
 
     use crate::{
-        assert_eq,
+        Path, assert_eq,
         expr::{
-            BaseExpr, BinaryExpr, BinaryOp, Expr,
+            BaseExpr, BinaryExpr, BinaryOp, Block, Expr,
             literal::{IntegerLiteral, Literal, StringLiteral},
         },
+        stmt::{Binding, Stmt},
     };
 
     #[test]
@@ -461,5 +521,48 @@ mod tests {
                 }),
             ),
         )
+    }
+
+    #[test]
+    fn parse_block() {
+        assert_eq(
+            "{decl x = 5; x + y}",
+            Spanned::new(
+                Span::new(0, 19),
+                Expr::Base(BaseExpr::Block(Block {
+                    stmts: vec![Spanned::new(
+                        Span::new(1, 12),
+                        Stmt::Binding(Binding {
+                            is_mutable: None,
+                            ident: Spanned::new(Span::new(6, 7), Intern::from("x")),
+                            value: Spanned::new(
+                                Span::new(10, 11),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                            ),
+                        }),
+                    )],
+                    tail: Some(Box::new(Spanned::new(
+                        Span::new(13, 18),
+                        Expr::Binary(BinaryExpr {
+                            lhs: Box::new(Spanned::new(
+                                Span::new(13, 14),
+                                Expr::Base(BaseExpr::Path(Path::single(Spanned::new(
+                                    Span::new(13, 14),
+                                    Intern::from("x"),
+                                )))),
+                            )),
+                            op: Spanned::new(Span::new(15, 16), BinaryOp::Add),
+                            rhs: Box::new(Spanned::new(
+                                Span::new(17, 18),
+                                Expr::Base(BaseExpr::Path(Path::single(Spanned::new(
+                                    Span::new(17, 18),
+                                    Intern::from("y"),
+                                )))),
+                            )),
+                        }),
+                    ))),
+                })),
+            ),
+        );
     }
 }

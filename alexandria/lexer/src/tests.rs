@@ -18,7 +18,7 @@ fn assert(input: &str, expect: &[Spanned<Token>]) {
         Ok(v) => assert_eq!(v.tokens, expect),
         Err(_) => {
             eprintln!("Failed to lex, diagnostics following: ");
-            diagnostics.write_stderr(&map).unwrap();
+            diagnostics.write_stdout(&map).unwrap();
             panic!()
         }
     }

@@ -37,11 +37,22 @@ pub enum TokenKind {
     Percent,
     LBracket,
     RBracket,
+    LCurly,
+    RCurly,
     Pipe,
     Invalid,
     Integer,
     StringLit,
     Ident,
+}
+
+impl TokenKind {
+    pub const fn is_atom(&self) -> bool {
+        !matches!(
+            self,
+            TokenKind::Integer | TokenKind::StringLit | TokenKind::Ident
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -116,6 +127,8 @@ impl<'s, 'd> Lexer<'s, 'd> {
                 '~' => Tilde,
                 '[' => LBracket,
                 ']' => RBracket,
+                '{' => LCurly,
+                '}' => RCurly,
                 '|' => Pipe,
                 '%' => Percent,
                 '0'..='9' => {

@@ -1,16 +1,35 @@
 pub mod expr;
+pub mod stmt;
 
 use diagnostic::Diagnostics;
 use lexer::{Intern, Token, TokenKind, stream::TokenStream};
+use smallvec::SmallVec;
 use span::{Span, Spanned, source::SourceIdx};
 
 pub type ParseResult<T> = std::result::Result<T, ParseError>;
 
+macro_rules! keywords {
+    (
+        $(
+            $ident:ident = $value:expr
+        ),*
+    ) => {
+        $(
+            pub static $ident: ::std::sync::LazyLock<Intern<str>> =
+            ::std::sync::LazyLock::new(|| Intern::from($value));
+        )*
+    };
+}
+
+keywords! {
+    DECL = "decl"
+}
+
 #[derive(Clone, Debug)]
 pub enum ParseError {
     Eof,
-    // TODO: replace with smallvec or something
-    TokenMismatch(Vec<TokenKind>, Span),
+    TokenMismatch(SmallVec<[TokenKind; 6]>, Span),
+    ExpectedKw(Intern<str>, Span),
 }
 
 pub struct Parser<'s, 'd> {
@@ -32,6 +51,7 @@ impl<'s, 'd> Parser<'s, 'd> {
         let mut guard = ParseGuard {
             stream: self.tokens,
             diagnostics: self.diagnostics,
+            diag_len: 0,
             committed: 0,
             index: &mut 0,
         };
@@ -44,10 +64,19 @@ pub struct ParseGuard<'d, 's, 'i> {
     diagnostics: &'d mut Diagnostics,
     index: &'i mut usize,
     committed: usize,
+    diag_len: usize,
     stream: &'s [Spanned<Token>],
 }
 
 impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
+    pub fn commit_diag(&mut self) {
+        self.diag_len = self.diagnostics.len();
+    }
+
+    pub fn rollback_diag(&mut self) {
+        self.diagnostics.cull(self.diag_len);
+    }
+
     pub fn commit(&mut self) {
         self.committed = *self.index;
     }
@@ -77,7 +106,7 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
                 *self.index += 1;
                 Ok(*v)
             }
-            Some(v) => Err(ParseError::TokenMismatch(vec![v.item.kind], v.span)),
+            Some(v) => Err(ParseError::TokenMismatch(smallvec::smallvec![kind], v.span)),
             None => Err(ParseError::Eof),
         }
     }
@@ -85,7 +114,7 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
     pub fn peek_require(&self, kind: TokenKind) -> ParseResult<Spanned<Token>> {
         match self.stream.get(*self.index) {
             Some(v) if v.item.kind == kind => Ok(*v),
-            Some(v) => Err(ParseError::TokenMismatch(vec![v.item.kind], v.span)),
+            Some(v) => Err(ParseError::TokenMismatch(smallvec::smallvec![kind], v.span)),
             None => Err(ParseError::Eof),
         }
     }
@@ -103,6 +132,7 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
     {
         let mut index = *self.index;
         let guard = ParseGuard {
+            diag_len: self.diagnostics.len(),
             diagnostics: self.diagnostics,
             committed: index,
             index: &mut index,
@@ -119,12 +149,13 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
         Ok(Spanned::new(span, result))
     }
 
-    pub fn with<F, T>(&mut self, f: F) -> ParseResult<T>
+    pub fn with<F, T, E>(&mut self, f: F) -> Result<T, E>
     where
-        for<'d2, 's2, 'i2> F: FnOnce(ParseGuard<'d2, 's2, 'i2>) -> ParseResult<T>,
+        for<'d2, 's2, 'i2> F: FnOnce(ParseGuard<'d2, 's2, 'i2>) -> Result<T, E>,
     {
         let mut index = *self.index;
         let guard = ParseGuard {
+            diag_len: self.diagnostics.len(),
             diagnostics: self.diagnostics,
             committed: index,
             index: &mut index,
@@ -132,6 +163,7 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
         };
 
         let result = f(guard)?;
+
         *self.index = index;
         Ok(result)
     }
@@ -160,7 +192,7 @@ impl Parse for Path {
     fn parse<'diag, 'source, 'index>(
         mut guard: ParseGuard<'diag, 'source, 'index>,
     ) -> ParseResult<Self> {
-        // using spanning so that it's atomic
+        // using new guard so that it's atomic
         let is_fully_qualified = guard.spanning(consume_double_colon).is_ok();
         let mut segments = vec![guard.next_require(TokenKind::Ident)?.map(|x| x.symbol)];
 
@@ -214,7 +246,7 @@ where
         Ok(v) => v,
         Err(_) => {
             eprintln!("Input failed to lex. Diagnostics: ");
-            diagnostics.write_stderr(&sources).unwrap();
+            diagnostics.write_stdout(&sources).unwrap();
             panic!();
         }
     };
@@ -224,7 +256,7 @@ where
         Ok(v) => v,
         Err(e) => {
             eprintln!("Failed to parse tokens. Error: {e:#?}. Diagnostics: ");
-            diagnostics.write_stderr(&sources).unwrap();
+            diagnostics.write_stdout(&sources).unwrap();
             panic!();
         }
     };
