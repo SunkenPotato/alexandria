@@ -3,7 +3,7 @@ use lexer::TokenKind;
 use span::{Span, Spanned};
 
 use crate::{
-    Parse, ParseError, ParseGuard, ParseResult, Path,
+    ELSE, IF, Parse, ParseError, ParseGuard, ParseResult, Path,
     expr::literal::Literal,
     stmt::{Binding, Stmt},
 };
@@ -190,6 +190,7 @@ pub enum BaseExpr {
     Block(Block),
     FnCall(FnCall),
     Parenthesized(Box<Expr>),
+    Conditional(ConditionalExpr),
 }
 
 impl Parse for BaseExpr {
@@ -200,6 +201,7 @@ impl Parse for BaseExpr {
             Self::Block(v) => v.is_ok(),
             Self::FnCall(v) => v.object.item.is_ok() && v.args.iter().all(|x| x.item.is_ok()),
             Self::Parenthesized(v) => v.is_ok(),
+            Self::Conditional(v) => v.is_ok(),
         }
     }
 
@@ -215,7 +217,22 @@ impl Parse for BaseExpr {
                 guard
                     .spanning(Literal::parse)
                     .map(|x| x.map(Self::Literal))
-                    .or_else(|_| guard.spanning(Path::parse).map(|x| x.map(Self::Path)))
+                    .or_else(|_| {
+                        dbg!(
+                            guard
+                                .spanning(ConditionalExpr::parse)
+                                .map(|x| x.map(Self::Conditional))
+                        )
+                    })
+                    .or_else(|_| {
+                        guard
+                            .spanning(|mut g| match g.with(Path::parse) {
+                                Ok(v) if v.is_ok() => Ok(v),
+                                Ok(_) => Err(ParseError::InternalParseError),
+                                Err(e) => Err(e),
+                            })
+                            .map(|x| x.map(Self::Path))
+                    })
                     .or_else(|_| guard.spanning(Block::parse).map(|x| x.map(Self::Block)))?,
             );
 
@@ -434,6 +451,92 @@ pub struct FnCall {
     pub args: Vec<Spanned<Expr>>,
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub struct ConditionalExpr {
+    pub main: Spanned<ConditionalBlock>,
+    pub alternatives: Vec<Spanned<ConditionalBlock>>,
+    pub fallback: Option<Spanned<Block>>,
+}
+
+impl Parse for ConditionalExpr {
+    fn is_ok(&self) -> bool {
+        self.main.item.is_ok()
+            && self.alternatives.iter().all(|x| x.item.is_ok())
+            && self.fallback.as_ref().is_none_or(|x| x.item.is_ok())
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        mut guard: ParseGuard<'diag, 'source, 'index>,
+    ) -> ParseResult<Self> {
+        let main = guard.spanning(ConditionalBlock::parse)?;
+        let mut alternatives = vec![];
+
+        while let Ok(block) = guard.spanning(ConditionalBlock::parse_else_if) {
+            alternatives.push(block);
+        }
+
+        let fallback = 'a: {
+            let Ok(else_kw) = guard.next_require(TokenKind::Ident) else {
+                break 'a None;
+            };
+
+            if else_kw.item.symbol != *ELSE {
+                break 'a None;
+            }
+
+            guard.spanning(Block::parse).ok()
+        };
+
+        Ok(Self {
+            main,
+            alternatives,
+            fallback,
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct ConditionalBlock {
+    pub condition: Box<Spanned<Expr>>,
+    pub block: Spanned<Block>,
+}
+
+impl ConditionalBlock {
+    fn parse_else_if(mut guard: ParseGuard) -> ParseResult<Self> {
+        let else_kw = guard.next_require(TokenKind::Ident)?;
+        if else_kw.item.symbol != *ELSE {
+            return Err(ParseError::ExpectedKw(else_kw.item.symbol, else_kw.span));
+        }
+
+        let block = guard.with(Self::parse)?;
+
+        Ok(block)
+    }
+}
+
+impl Parse for ConditionalBlock {
+    fn is_ok(&self) -> bool {
+        self.condition.item.is_ok() && self.block.item.is_ok()
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        mut guard: ParseGuard<'diag, 'source, 'index>,
+    ) -> ParseResult<Self> {
+        let kw = guard.next_require(TokenKind::Ident)?;
+        if kw.item.symbol != *IF {
+            return Err(ParseError::ExpectedKw(kw.item.symbol, kw.span));
+        }
+
+        guard.next_require(TokenKind::LParen)?;
+        let condition = Box::new(guard.spanning(Expr::parse)?);
+        guard.next_require(TokenKind::RParen)?;
+
+        let block = guard.spanning(Block::parse)?;
+
+        Ok(Self { condition, block })
+    }
+}
+
 // --- tests ---
 #[cfg(test)]
 mod tests {
@@ -443,7 +546,7 @@ mod tests {
     use crate::{
         Path, assert_eq,
         expr::{
-            BaseExpr, BinaryExpr, BinaryOp, Block, Expr, FnCall,
+            BaseExpr, BinaryExpr, BinaryOp, Block, ConditionalBlock, ConditionalExpr, Expr, FnCall,
             literal::{IntegerLiteral, Literal, StringLiteral},
         },
         stmt::{Binding, Stmt},
@@ -585,18 +688,24 @@ mod tests {
                         Expr::Binary(BinaryExpr {
                             lhs: Box::new(Spanned::new(
                                 Span::new(13, 14),
-                                Expr::Base(BaseExpr::Path(Path::single(Spanned::new(
-                                    Span::new(13, 14),
-                                    Intern::from("x"),
-                                )))),
+                                Expr::Base(BaseExpr::Path(
+                                    Path::single(Spanned::new(
+                                        Span::new(13, 14),
+                                        Intern::from("x"),
+                                    ))
+                                    .item,
+                                )),
                             )),
                             op: Spanned::new(Span::new(15, 16), BinaryOp::Add),
                             rhs: Box::new(Spanned::new(
                                 Span::new(17, 18),
-                                Expr::Base(BaseExpr::Path(Path::single(Spanned::new(
-                                    Span::new(17, 18),
-                                    Intern::from("y"),
-                                )))),
+                                Expr::Base(BaseExpr::Path(
+                                    Path::single(Spanned::new(
+                                        Span::new(17, 18),
+                                        Intern::from("y"),
+                                    ))
+                                    .item,
+                                )),
                             )),
                         }),
                     ))),
@@ -627,10 +736,9 @@ mod tests {
                 Expr::Base(BaseExpr::FnCall(FnCall {
                     object: Box::new(Spanned::new(
                         Span::new(0, 3),
-                        BaseExpr::Path(Path::single(Spanned::new(
-                            Span::new(0, 3),
-                            Intern::from("add"),
-                        ))),
+                        BaseExpr::Path(
+                            Path::single(Spanned::new(Span::new(0, 3), Intern::from("add"))).item,
+                        ),
                     )),
                     args: vec![
                         Spanned::new(
@@ -645,5 +753,40 @@ mod tests {
                 })),
             ),
         )
+    }
+
+    #[test]
+    fn parse_cond_expr() {
+        assert_eq(
+            "if (1) { 2 }",
+            Spanned::new(
+                Span::new(0, 12),
+                Expr::Base(BaseExpr::Conditional(ConditionalExpr {
+                    main: Spanned::new(
+                        Span::new(0, 12),
+                        ConditionalBlock {
+                            condition: Box::new(Spanned::new(
+                                Span::new(4, 5),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(1)))),
+                            )),
+                            block: Spanned::new(
+                                Span::new(7, 12),
+                                Block {
+                                    stmts: vec![],
+                                    tail: Some(Box::new(Spanned::new(
+                                        Span::new(9, 10),
+                                        Expr::Base(BaseExpr::Literal(Literal::Int(
+                                            IntegerLiteral::Ok(2),
+                                        ))),
+                                    ))),
+                                },
+                            ),
+                        },
+                    ),
+                    alternatives: vec![],
+                    fallback: None,
+                })),
+            ),
+        );
     }
 }

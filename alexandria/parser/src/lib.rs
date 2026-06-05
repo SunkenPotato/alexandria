@@ -18,18 +18,22 @@ macro_rules! keywords {
             pub static $ident: ::std::sync::LazyLock<Intern<str>> =
             ::std::sync::LazyLock::new(|| Intern::from($value));
         )*
+
+        pub static KEYWORDS: &[&::std::sync::LazyLock<Intern<str>>] = &[$(&$ident),*];
     };
 }
 
 keywords! {
-    DECL = "decl"
+    DECL = "decl",
+    IF = "if",
+    ELSE = "else"
 }
 
 #[derive(Clone, Debug)]
 pub enum ParseError {
-    Eof,
     TokenMismatch(SmallVec<[TokenKind; 6]>, Span),
     ExpectedKw(Intern<str>, Span),
+    InternalParseError,
 }
 
 pub struct Parser<'s, 'd> {
@@ -92,12 +96,28 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
                 *self.index += 1;
                 Ok(*v)
             }
-            None => Err(ParseError::Eof),
+            None => {
+                let span = self
+                    .stream
+                    .get(self.index.saturating_sub(1))
+                    .map(|x| x.span)
+                    .unwrap_or(Span::new(0, 0));
+
+                Err(ParseError::TokenMismatch(smallvec::smallvec![], span))
+            }
         }
     }
 
     pub fn peek(&self) -> ParseResult<Spanned<Token>> {
-        self.stream.get(*self.index).copied().ok_or(ParseError::Eof)
+        self.stream.get(*self.index).copied().ok_or_else(|| {
+            let span = self
+                .stream
+                .get(self.index.saturating_sub(1))
+                .map(|x| x.span)
+                .unwrap_or(Span::new(0, 0));
+
+            ParseError::TokenMismatch(smallvec::smallvec![], span)
+        })
     }
 
     pub fn next_require(&mut self, kind: TokenKind) -> ParseResult<Spanned<Token>> {
@@ -107,7 +127,15 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
                 Ok(*v)
             }
             Some(v) => Err(ParseError::TokenMismatch(smallvec::smallvec![kind], v.span)),
-            None => Err(ParseError::Eof),
+            None => {
+                let span = self
+                    .stream
+                    .get(self.index.saturating_sub(1))
+                    .map(|x| x.span)
+                    .unwrap_or(Span::new(0, 0));
+
+                Err(ParseError::TokenMismatch(smallvec::smallvec![kind], span))
+            }
         }
     }
 
@@ -115,14 +143,30 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
         match self.stream.get(*self.index) {
             Some(v) if v.item.kind == kind => Ok(*v),
             Some(v) => Err(ParseError::TokenMismatch(smallvec::smallvec![kind], v.span)),
-            None => Err(ParseError::Eof),
+            None => {
+                let span = self
+                    .stream
+                    .get(self.index.saturating_sub(1))
+                    .map(|x| x.span)
+                    .unwrap_or(Span::new(0, 0));
+
+                Err(ParseError::TokenMismatch(smallvec::smallvec![kind], span))
+            }
         }
     }
 
     pub fn peek_n(&self, n: usize) -> ParseResult<Spanned<Token>> {
         match self.stream.get(*self.index + n) {
             Some(v) => Ok(*v),
-            None => Err(ParseError::Eof),
+            None => {
+                let span = self
+                    .stream
+                    .get(self.index.saturating_sub(1))
+                    .map(|x| x.span)
+                    .unwrap_or(Span::new(0, 0));
+
+                Err(ParseError::TokenMismatch(smallvec::smallvec![], span))
+            }
         }
     }
 
@@ -171,22 +215,45 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Path {
-    segments: Vec<Spanned<Intern<str>>>,
-    is_fully_qualified: bool,
+    pub segments: Vec<Spanned<Segment>>,
+    pub is_fully_qualified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Segment {
+    pub is_kw: bool,
+    pub segment: Intern<str>,
+}
+
+impl Segment {
+    #[cfg(test)]
+    pub fn new(val: &str) -> Self {
+        Self {
+            is_kw: false,
+            segment: Intern::from(val),
+        }
+    }
 }
 
 impl Path {
-    pub fn single(val: Spanned<Intern<str>>) -> Self {
-        Self {
-            segments: vec![val],
-            is_fully_qualified: false,
-        }
+    #[cfg(test)]
+    pub fn single(val: Spanned<Intern<str>>) -> Spanned<Self> {
+        Spanned::new(
+            val.span,
+            Self {
+                segments: vec![val.map(|x| Segment {
+                    is_kw: false,
+                    segment: x,
+                })],
+                is_fully_qualified: false,
+            },
+        )
     }
 }
 
 impl Parse for Path {
     fn is_ok(&self) -> bool {
-        true
+        self.segments.iter().all(|x| !x.item.is_kw)
     }
 
     fn parse<'diag, 'source, 'index>(
@@ -194,14 +261,22 @@ impl Parse for Path {
     ) -> ParseResult<Self> {
         // using new guard so that it's atomic
         let is_fully_qualified = guard.spanning(consume_double_colon).is_ok();
-        let mut segments = vec![guard.next_require(TokenKind::Ident)?.map(|x| x.symbol)];
+        let first = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+        let first_is_kw = KEYWORDS.iter().any(|x| ***x == first.item);
+        let mut segments = vec![first.map(|x| Segment {
+            is_kw: first_is_kw,
+            segment: x,
+        })];
 
         loop {
             if guard.spanning(consume_double_colon).is_err() {
                 break;
             }
 
-            segments.push(guard.next_require(TokenKind::Ident)?.map(|x| x.symbol));
+            let segment = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+            let is_kw = KEYWORDS.iter().any(|x| ***x == segment.item);
+
+            segments.push(segment.map(|x| Segment { is_kw, segment: x }));
         }
 
         Ok(Self {
@@ -269,7 +344,7 @@ mod tests {
     use lexer::Intern;
     use span::{Span, Spanned};
 
-    use crate::{Path, assert_eq};
+    use crate::{Path, Segment, assert_eq};
 
     #[test]
     fn parse_fq_path() {
@@ -280,8 +355,8 @@ mod tests {
                 Path {
                     is_fully_qualified: true,
                     segments: vec![
-                        Spanned::new(Span::new(2, 5), Intern::from("std")),
-                        Spanned::new(Span::new(7, 9), Intern::from("io")),
+                        Spanned::new(Span::new(2, 5), Segment::new("std")),
+                        Spanned::new(Span::new(7, 9), Segment::new("io")),
                     ],
                 },
             ),
@@ -297,8 +372,8 @@ mod tests {
                 Path {
                     is_fully_qualified: false,
                     segments: vec![
-                        Spanned::new(Span::new(0, 3), Intern::from("std")),
-                        Spanned::new(Span::new(5, 7), Intern::from("io")),
+                        Spanned::new(Span::new(0, 3), Segment::new("std")),
+                        Spanned::new(Span::new(5, 7), Segment::new("io")),
                     ],
                 },
             ),
@@ -309,10 +384,7 @@ mod tests {
     fn parse_single_path() {
         assert_eq(
             "tmp",
-            Spanned::new(
-                Span::new(0, 3),
-                Path::single(Spanned::new(Span::new(0, 3), Intern::from("tmp"))),
-            ),
+            Path::single(Spanned::new(Span::new(0, 3), Intern::from("tmp"))),
         );
     }
 }
