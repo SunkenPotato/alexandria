@@ -3,7 +3,7 @@ use lexer::TokenKind;
 use span::{Span, Spanned};
 
 use crate::{
-    ELSE, IF, LOOP, Parse, ParseError, ParseGuard, ParseResult, Path,
+    BREAK, CONTINUE, ELSE, IF, LOOP, Parse, ParseError, ParseGuard, ParseResult, Path,
     expr::literal::Literal,
     stmt::{Binding, Stmt},
 };
@@ -192,6 +192,8 @@ pub enum BaseExpr {
     Parenthesized(Box<Expr>),
     Conditional(ConditionalExpr),
     Loop(Block),
+    Continue,
+    Break(Option<Box<Spanned<Expr>>>),
 }
 
 impl Parse for BaseExpr {
@@ -203,6 +205,8 @@ impl Parse for BaseExpr {
             Self::FnCall(v) => v.object.item.is_ok() && v.args.iter().all(|x| x.item.is_ok()),
             Self::Parenthesized(v) => v.is_ok(),
             Self::Conditional(v) => v.is_ok(),
+            Self::Continue => true,
+            Self::Break(v) => v.as_ref().is_none_or(|x| x.item.is_ok()),
         }
     }
 
@@ -223,6 +227,8 @@ impl Parse for BaseExpr {
                             .spanning(ConditionalExpr::parse)
                             .map(|x| x.map(Self::Conditional))
                     })
+                    .or_else(|_| guard.spanning(parse_break))
+                    .or_else(|_| guard.spanning(parse_continue))
                     .or_else(|_| guard.spanning(parse_loop))
                     .or_else(|_| {
                         guard
@@ -270,6 +276,28 @@ fn parse_loop(mut guard: ParseGuard) -> ParseResult<BaseExpr> {
     let block = guard.with(Block::parse)?;
 
     Ok(BaseExpr::Loop(block))
+}
+
+fn parse_continue(mut guard: ParseGuard) -> ParseResult<BaseExpr> {
+    let kw = guard.next_require(TokenKind::Ident)?;
+
+    if kw.item.symbol != *CONTINUE {
+        return Err(ParseError::ExpectedKw(*LOOP, kw.span));
+    }
+
+    Ok(BaseExpr::Continue)
+}
+
+fn parse_break(mut guard: ParseGuard) -> ParseResult<BaseExpr> {
+    let kw = guard.next_require(TokenKind::Ident)?;
+
+    if kw.item.symbol != *BREAK {
+        return Err(ParseError::ExpectedKw(*BREAK, kw.span));
+    }
+
+    let expr = guard.spanning(Expr::parse).ok().map(Box::new);
+
+    Ok(BaseExpr::Break(expr))
 }
 
 pub mod literal {
@@ -832,6 +860,36 @@ mod tests {
                         })),
                     ))),
                 })),
+            ),
+        )
+    }
+
+    #[test]
+    fn parse_continue() {
+        assert_eq(
+            "continue",
+            Spanned::new(Span::new(0, 8), Expr::Base(BaseExpr::Continue)),
+        );
+    }
+
+    #[test]
+    fn parse_break() {
+        assert_eq(
+            "break",
+            Spanned::new(Span::new(0, 5), Expr::Base(BaseExpr::Break(None))),
+        )
+    }
+
+    #[test]
+    fn parse_break_with_expr() {
+        assert_eq(
+            "break 5",
+            Spanned::new(
+                Span::new(0, 7),
+                Expr::Base(BaseExpr::Break(Some(Box::new(Spanned::new(
+                    Span::new(6, 7),
+                    Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                ))))),
             ),
         )
     }

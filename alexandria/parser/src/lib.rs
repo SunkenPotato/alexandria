@@ -27,7 +27,9 @@ keywords! {
     DECL = "decl",
     IF = "if",
     ELSE = "else",
-    LOOP = "loop"
+    LOOP = "loop",
+    CONTINUE = "continue",
+    BREAK = "break"
 }
 
 #[derive(Clone, Debug)]
