@@ -1,4 +1,5 @@
 pub mod expr;
+pub mod item;
 pub mod stmt;
 
 use diagnostic::Diagnostics;
@@ -29,7 +30,12 @@ keywords! {
     ELSE = "else",
     LOOP = "loop",
     CONTINUE = "continue",
-    BREAK = "break"
+    BREAK = "break",
+    RETURN = "return",
+    PRODUCT = "product",
+    SUM = "sum",
+    FUNC = "func",
+    PUBLIC = "pub"
 }
 
 #[derive(Clone, Debug)]

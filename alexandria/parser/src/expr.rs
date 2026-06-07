@@ -1,9 +1,9 @@
 use diagnostic::Diagnostic;
-use lexer::TokenKind;
+use lexer::{Intern, TokenKind};
 use span::{Span, Spanned};
 
 use crate::{
-    BREAK, CONTINUE, ELSE, IF, LOOP, Parse, ParseError, ParseGuard, ParseResult, Path,
+    BREAK, CONTINUE, ELSE, IF, LOOP, Parse, ParseError, ParseGuard, ParseResult, Path, RETURN,
     expr::literal::Literal,
     stmt::{Binding, Stmt},
 };
@@ -194,6 +194,7 @@ pub enum BaseExpr {
     Loop(Block),
     Continue,
     Break(Option<Box<Spanned<Expr>>>),
+    Return(Option<Box<Spanned<Expr>>>),
 }
 
 impl Parse for BaseExpr {
@@ -206,7 +207,7 @@ impl Parse for BaseExpr {
             Self::Parenthesized(v) => v.is_ok(),
             Self::Conditional(v) => v.is_ok(),
             Self::Continue => true,
-            Self::Break(v) => v.as_ref().is_none_or(|x| x.item.is_ok()),
+            Self::Break(v) | Self::Return(v) => v.as_ref().is_none_or(|x| x.item.is_ok()),
         }
     }
 
@@ -227,7 +228,8 @@ impl Parse for BaseExpr {
                             .spanning(ConditionalExpr::parse)
                             .map(|x| x.map(Self::Conditional))
                     })
-                    .or_else(|_| guard.spanning(parse_break))
+                    .or_else(|_| guard.spanning(parse_kw_with_expr(*BREAK, BaseExpr::Break)))
+                    .or_else(|_| guard.spanning(parse_kw_with_expr(*RETURN, BaseExpr::Return)))
                     .or_else(|_| guard.spanning(parse_continue))
                     .or_else(|_| guard.spanning(parse_loop))
                     .or_else(|_| {
@@ -288,16 +290,21 @@ fn parse_continue(mut guard: ParseGuard) -> ParseResult<BaseExpr> {
     Ok(BaseExpr::Continue)
 }
 
-fn parse_break(mut guard: ParseGuard) -> ParseResult<BaseExpr> {
-    let kw = guard.next_require(TokenKind::Ident)?;
+fn parse_kw_with_expr(
+    kw: Intern<str>,
+    mapper: impl Fn(Option<Box<Spanned<Expr>>>) -> BaseExpr,
+) -> impl Fn(ParseGuard) -> ParseResult<BaseExpr> {
+    move |mut guard| {
+        let next = guard.next_require(TokenKind::Ident)?;
 
-    if kw.item.symbol != *BREAK {
-        return Err(ParseError::ExpectedKw(*BREAK, kw.span));
+        if next.item.symbol != kw {
+            return Err(ParseError::ExpectedKw(kw, next.span));
+        }
+
+        let expr = guard.spanning(Expr::parse).ok().map(Box::new);
+
+        Ok(mapper(expr))
     }
-
-    let expr = guard.spanning(Expr::parse).ok().map(Box::new);
-
-    Ok(BaseExpr::Break(expr))
 }
 
 pub mod literal {
