@@ -3,7 +3,7 @@ use lexer::TokenKind;
 use span::{Span, Spanned};
 
 use crate::{
-    ELSE, IF, Parse, ParseError, ParseGuard, ParseResult, Path,
+    ELSE, IF, LOOP, Parse, ParseError, ParseGuard, ParseResult, Path,
     expr::literal::Literal,
     stmt::{Binding, Stmt},
 };
@@ -191,6 +191,7 @@ pub enum BaseExpr {
     FnCall(FnCall),
     Parenthesized(Box<Expr>),
     Conditional(ConditionalExpr),
+    Loop(Block),
 }
 
 impl Parse for BaseExpr {
@@ -198,7 +199,7 @@ impl Parse for BaseExpr {
         match self {
             Self::Literal(v) => v.is_ok(),
             Self::Path(v) => v.is_ok(),
-            Self::Block(v) => v.is_ok(),
+            Self::Block(v) | Self::Loop(v) => v.is_ok(),
             Self::FnCall(v) => v.object.item.is_ok() && v.args.iter().all(|x| x.item.is_ok()),
             Self::Parenthesized(v) => v.is_ok(),
             Self::Conditional(v) => v.is_ok(),
@@ -218,12 +219,11 @@ impl Parse for BaseExpr {
                     .spanning(Literal::parse)
                     .map(|x| x.map(Self::Literal))
                     .or_else(|_| {
-                        dbg!(
-                            guard
-                                .spanning(ConditionalExpr::parse)
-                                .map(|x| x.map(Self::Conditional))
-                        )
+                        guard
+                            .spanning(ConditionalExpr::parse)
+                            .map(|x| x.map(Self::Conditional))
                     })
+                    .or_else(|_| guard.spanning(parse_loop))
                     .or_else(|_| {
                         guard
                             .spanning(|mut g| match g.with(Path::parse) {
@@ -258,6 +258,18 @@ impl Parse for BaseExpr {
             }
         }
     }
+}
+
+fn parse_loop(mut guard: ParseGuard) -> ParseResult<BaseExpr> {
+    let kw = guard.next_require(TokenKind::Ident)?;
+
+    if kw.item.symbol != *LOOP {
+        return Err(ParseError::ExpectedKw(*LOOP, kw.span));
+    }
+
+    let block = guard.with(Block::parse)?;
+
+    Ok(BaseExpr::Loop(block))
 }
 
 pub mod literal {
@@ -788,5 +800,39 @@ mod tests {
                 })),
             ),
         );
+    }
+
+    #[test]
+    fn parse_loop() {
+        assert_eq(
+            "loop { print(\"x\") }",
+            Spanned::new(
+                Span::new(0, 19),
+                Expr::Base(BaseExpr::Loop(Block {
+                    stmts: vec![],
+                    tail: Some(Box::new(Spanned::new(
+                        Span::new(7, 17),
+                        Expr::Base(BaseExpr::FnCall(FnCall {
+                            object: Box::new(Spanned::new(
+                                Span::new(7, 12),
+                                BaseExpr::Path(
+                                    Path::single(Spanned::new(
+                                        Span::new(7, 12),
+                                        Intern::from("print"),
+                                    ))
+                                    .item,
+                                ),
+                            )),
+                            args: vec![Spanned::new(
+                                Span::new(13, 16),
+                                Expr::Base(BaseExpr::Literal(Literal::Str(StringLiteral::Ok(
+                                    Intern::from("x"),
+                                )))),
+                            )],
+                        })),
+                    ))),
+                })),
+            ),
+        )
     }
 }

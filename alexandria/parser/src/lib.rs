@@ -26,7 +26,8 @@ macro_rules! keywords {
 keywords! {
     DECL = "decl",
     IF = "if",
-    ELSE = "else"
+    ELSE = "else",
+    LOOP = "loop"
 }
 
 #[derive(Clone, Debug)]
