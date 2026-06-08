@@ -1,7 +1,7 @@
 use lexer::{Intern, TokenKind};
 use span::Spanned;
 
-use crate::{PRODUCT, PUBLIC, Parse, ParseError, ParseGuard, ParseResult, Path};
+use crate::{PRODUCT, PUBLIC, Parse, ParseError, ParseGuard, ParseResult, Path, SUM};
 
 type Generics = Option<Spanned<Vec<Spanned<Intern<str>>>>>;
 
@@ -50,7 +50,7 @@ pub struct ProductDef {
 
 impl Parse for ProductDef {
     fn is_ok(&self) -> bool {
-        todo!()
+        self.vis.item.is_ok() && self.fields.iter().all(|x| x.is_ok())
     }
 
     fn parse<'diag, 'source, 'index>(
@@ -115,6 +115,62 @@ impl Parse for ProductField {
         let ty = guard.spanning(Type::parse)?;
 
         Ok(Self { ident, ty })
+    }
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct SumDef {
+    pub vis: Spanned<Visibility>,
+    pub ident: Spanned<Intern<str>>,
+    pub generics: Generics,
+    pub fields: Vec<ProductField>,
+}
+
+impl Parse for SumDef {
+    fn is_ok(&self) -> bool {
+        self.vis.item.is_ok() && self.fields.iter().all(|x| x.is_ok())
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        mut guard: ParseGuard<'diag, 'source, 'index>,
+    ) -> ParseResult<Self> {
+        let vis = guard.spanning(Visibility::parse)?;
+        let kw = guard.next_require(TokenKind::Ident)?;
+
+        if kw.item.symbol != *SUM {
+            return Err(ParseError::ExpectedKw(*SUM, kw.span));
+        }
+
+        let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+        let generics = if guard.peek_require(TokenKind::LBracket).is_ok() {
+            Some(guard.spanning(parse_generics)?)
+        } else {
+            None
+        };
+
+        guard.next_require(TokenKind::LCurly)?;
+
+        let mut fields = vec![];
+
+        while let Ok(field) = guard.with(ProductField::parse) {
+            fields.push(field);
+            if guard.next_require(TokenKind::Comma).is_ok() {
+                if guard.peek_require(TokenKind::RCurly).is_ok() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        guard.next_require(TokenKind::RCurly)?;
+
+        Ok(Self {
+            vis,
+            ident,
+            generics,
+            fields,
+        })
     }
 }
 
@@ -242,5 +298,54 @@ mod tests {
                 },
             ),
         );
+    }
+
+    #[test]
+    fn parse_sum_def() {
+        assert_eq(
+            "sum Result[T, E] { Ok: T, Err: E }",
+            Spanned::new(
+                Span::new(0, 34),
+                SumDef {
+                    vis: Spanned::new(Span::new(0, 0), Visibility::Private),
+                    ident: Spanned::new(Span::new(4, 10), Intern::from("Result")),
+                    generics: Some(Spanned::new(
+                        Span::new(10, 16),
+                        vec![
+                            Spanned::new(Span::new(11, 12), Intern::from("T")),
+                            Spanned::new(Span::new(14, 15), Intern::from("E")),
+                        ],
+                    )),
+                    fields: vec![
+                        ProductField {
+                            ident: Spanned::new(Span::new(19, 21), Intern::from("Ok")),
+                            ty: Spanned::new(
+                                Span::new(23, 24),
+                                Type {
+                                    path: Path::single(Spanned::new(
+                                        Span::new(23, 24),
+                                        Intern::from("T"),
+                                    )),
+                                    generics: None,
+                                },
+                            ),
+                        },
+                        ProductField {
+                            ident: Spanned::new(Span::new(26, 29), Intern::from("Err")),
+                            ty: Spanned::new(
+                                Span::new(31, 32),
+                                Type {
+                                    path: Path::single(Spanned::new(
+                                        Span::new(31, 32),
+                                        Intern::from("E"),
+                                    )),
+                                    generics: None,
+                                },
+                            ),
+                        },
+                    ],
+                },
+            ),
+        )
     }
 }

@@ -194,9 +194,19 @@ impl<'d, 's, 'i> ParseGuard<'d, 's, 'i> {
 
         let result = f(guard)?;
 
-        let span = self.stream[*self.index..index]
-            .iter()
-            .fold(self.stream[*self.index].span, |pre, t| pre.extend(t.span));
+        let span = if *self.index == index {
+            let next_token_span = self
+                .stream
+                .get(index)
+                .map(|x| x.span)
+                .unwrap_or(Span::new(0, 0));
+
+            Span::new(next_token_span.start(), next_token_span.start())
+        } else {
+            self.stream[*self.index..index]
+                .iter()
+                .fold(self.stream[*self.index].span, |pre, t| pre.extend(t.span))
+        };
         *self.index = index;
 
         Ok(Spanned::new(span, result))
