@@ -1,7 +1,9 @@
 use lexer::{Intern, TokenKind};
 use span::Spanned;
 
-use crate::{PRODUCT, PUBLIC, Parse, ParseError, ParseGuard, ParseResult, Path, SUM};
+use crate::{
+    FUNC, PRODUCT, PUBLIC, Parse, ParseError, ParseGuard, ParseResult, Path, SUM, expr::Block,
+};
 
 type Generics = Option<Spanned<Vec<Spanned<Intern<str>>>>>;
 
@@ -45,7 +47,7 @@ pub struct ProductDef {
     pub vis: Spanned<Visibility>,
     pub ident: Spanned<Intern<str>>,
     pub generics: Generics,
-    pub fields: Vec<ProductField>,
+    pub fields: Vec<Field>,
 }
 
 impl Parse for ProductDef {
@@ -74,7 +76,7 @@ impl Parse for ProductDef {
 
         let mut fields = vec![];
 
-        while let Ok(field) = guard.with(ProductField::parse) {
+        while let Ok(field) = guard.with(Field::parse) {
             fields.push(field);
             if guard.next_require(TokenKind::Comma).is_ok() {
                 if guard.peek_require(TokenKind::RCurly).is_ok() {
@@ -97,12 +99,12 @@ impl Parse for ProductDef {
 }
 
 #[derive(PartialEq, Debug, Clone)]
-pub struct ProductField {
+pub struct Field {
     pub ident: Spanned<Intern<str>>,
     pub ty: Spanned<Type>,
 }
 
-impl Parse for ProductField {
+impl Parse for Field {
     fn is_ok(&self) -> bool {
         self.ty.item.is_ok()
     }
@@ -123,7 +125,7 @@ pub struct SumDef {
     pub vis: Spanned<Visibility>,
     pub ident: Spanned<Intern<str>>,
     pub generics: Generics,
-    pub fields: Vec<ProductField>,
+    pub fields: Vec<Field>,
 }
 
 impl Parse for SumDef {
@@ -152,7 +154,7 @@ impl Parse for SumDef {
 
         let mut fields = vec![];
 
-        while let Ok(field) = guard.with(ProductField::parse) {
+        while let Ok(field) = guard.with(Field::parse) {
             fields.push(field);
             if guard.next_require(TokenKind::Comma).is_ok() {
                 if guard.peek_require(TokenKind::RCurly).is_ok() {
@@ -224,13 +226,81 @@ fn parse_generics(mut guard: ParseGuard) -> ParseResult<Vec<Spanned<Intern<str>>
 pub struct FnDef {
     pub vis: Spanned<Visibility>,
     pub ident: Spanned<Intern<str>>,
+    pub generics: Generics,
+    pub args: Vec<Field>,
+    pub ret_ty: Option<Spanned<Type>>,
+    pub block: Spanned<Block>,
+}
+
+impl Parse for FnDef {
+    fn is_ok(&self) -> bool {
+        self.vis.item.is_ok()
+            && self.ret_ty.as_ref().is_none_or(|x| x.item.is_ok())
+            && self.args.iter().all(Parse::is_ok)
+            && self.block.item.is_ok()
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        mut guard: ParseGuard<'diag, 'source, 'index>,
+    ) -> ParseResult<Self> {
+        let vis = guard.spanning(Visibility::parse)?;
+        let func_kw = guard.next_require(TokenKind::Ident)?;
+
+        if func_kw.item.symbol != *FUNC {
+            return Err(ParseError::ExpectedKw(*FUNC, func_kw.span));
+        }
+
+        let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+        let generics = if guard.peek_require(TokenKind::LBracket).is_ok() {
+            Some(guard.spanning(parse_generics)?)
+        } else {
+            None
+        };
+
+        guard.next_require(TokenKind::LCurly)?;
+
+        let mut args = vec![];
+
+        while let Ok(arg) = guard.with(Field::parse) {
+            args.push(arg);
+            if guard.next_require(TokenKind::Comma).is_ok() {
+                if guard.peek_require(TokenKind::RCurly).is_ok() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        guard.next_require(TokenKind::RCurly)?;
+
+        let ret_ty = if guard.next_require(TokenKind::Colon).is_ok() {
+            Some(guard.spanning(Type::parse)?)
+        } else {
+            None
+        };
+
+        let block = guard.spanning(Block::parse)?;
+
+        Ok(FnDef {
+            vis,
+            ident,
+            generics,
+            args,
+            ret_ty,
+            block,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use span::Span;
 
-    use crate::assert_eq;
+    use crate::{
+        assert_eq,
+        expr::{BaseExpr, BinaryExpr, BinaryOp, Expr},
+    };
 
     use super::*;
 
@@ -265,7 +335,7 @@ mod tests {
                         vec![Spanned::new(Span::new(16, 17), Intern::from("T"))],
                     )),
                     fields: vec![
-                        ProductField {
+                        Field {
                             ident: Spanned::new(Span::new(21, 24), Intern::from("ptr")),
                             ty: Spanned::new(
                                 Span::new(26, 32),
@@ -281,7 +351,7 @@ mod tests {
                                 },
                             ),
                         },
-                        ProductField {
+                        Field {
                             ident: Spanned::new(Span::new(34, 37), Intern::from("len")),
                             ty: Spanned::new(
                                 Span::new(39, 44),
@@ -317,7 +387,7 @@ mod tests {
                         ],
                     )),
                     fields: vec![
-                        ProductField {
+                        Field {
                             ident: Spanned::new(Span::new(19, 21), Intern::from("Ok")),
                             ty: Spanned::new(
                                 Span::new(23, 24),
@@ -330,7 +400,7 @@ mod tests {
                                 },
                             ),
                         },
-                        ProductField {
+                        Field {
                             ident: Spanned::new(Span::new(26, 29), Intern::from("Err")),
                             ty: Spanned::new(
                                 Span::new(31, 32),
@@ -347,5 +417,90 @@ mod tests {
                 },
             ),
         )
+    }
+
+    #[test]
+    fn parse_fn_def() {
+        assert_eq(
+            "pub func add[T] { rhs: T, lhs: T }: T { rhs + lhs }",
+            Spanned::new(
+                Span::new(0, 51),
+                FnDef {
+                    vis: Spanned::new(Span::new(0, 3), Visibility::Public),
+                    ident: Spanned::new(Span::new(9, 12), Intern::from("add")),
+                    generics: Some(Spanned::new(
+                        Span::new(12, 15),
+                        vec![Spanned::new(Span::new(13, 14), Intern::from("T"))],
+                    )),
+                    args: vec![
+                        Field {
+                            ident: Spanned::new(Span::new(18, 21), Intern::from("rhs")),
+                            ty: Spanned::new(
+                                Span::new(23, 24),
+                                Type {
+                                    path: Path::single(Spanned::new(
+                                        Span::new(23, 24),
+                                        Intern::from("T"),
+                                    )),
+                                    generics: None,
+                                },
+                            ),
+                        },
+                        Field {
+                            ident: Spanned::new(Span::new(26, 29), Intern::from("lhs")),
+                            ty: Spanned::new(
+                                Span::new(31, 32),
+                                Type {
+                                    path: Path::single(Spanned::new(
+                                        Span::new(31, 32),
+                                        Intern::from("T"),
+                                    )),
+                                    generics: None,
+                                },
+                            ),
+                        },
+                    ],
+                    ret_ty: Some(Spanned::new(
+                        Span::new(36, 37),
+                        Type {
+                            path: Path::single(Spanned::new(Span::new(36, 37), Intern::from("T"))),
+                            generics: None,
+                        },
+                    )),
+                    block: Spanned::new(
+                        Span::new(38, 51),
+                        Block {
+                            stmts: vec![],
+                            tail: Some(Box::new(Spanned::new(
+                                Span::new(40, 49),
+                                Expr::Binary(BinaryExpr {
+                                    lhs: Box::new(Spanned::new(
+                                        Span::new(40, 43),
+                                        Expr::Base(BaseExpr::Path(
+                                            Path::single(Spanned::new(
+                                                Span::new(40, 43),
+                                                Intern::from("rhs"),
+                                            ))
+                                            .item,
+                                        )),
+                                    )),
+                                    op: Spanned::new(Span::new(44, 45), BinaryOp::Add),
+                                    rhs: Box::new(Spanned::new(
+                                        Span::new(46, 49),
+                                        Expr::Base(BaseExpr::Path(
+                                            Path::single(Spanned::new(
+                                                Span::new(46, 49),
+                                                Intern::from("lhs"),
+                                            ))
+                                            .item,
+                                        )),
+                                    )),
+                                }),
+                            ))),
+                        },
+                    ),
+                },
+            ),
+        );
     }
 }
