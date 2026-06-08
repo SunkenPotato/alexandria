@@ -35,7 +35,8 @@ keywords! {
     PRODUCT = "product",
     SUM = "sum",
     FUNC = "func",
-    PUBLIC = "pub"
+    PUBLIC = "pub",
+    IMPORT = "import"
 }
 
 #[derive(Clone, Debug)]

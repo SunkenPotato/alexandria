@@ -2,7 +2,8 @@ use lexer::{Intern, TokenKind};
 use span::Spanned;
 
 use crate::{
-    FUNC, PRODUCT, PUBLIC, Parse, ParseError, ParseGuard, ParseResult, Path, SUM, expr::Block,
+    FUNC, IMPORT, PRODUCT, PUBLIC, Parse, ParseError, ParseGuard, ParseResult, Path, SUM,
+    expr::Block,
 };
 
 type Generics = Option<Spanned<Vec<Spanned<Intern<str>>>>>;
@@ -11,8 +12,40 @@ type Generics = Option<Spanned<Vec<Spanned<Intern<str>>>>>;
 pub enum Item {
     FnDef(FnDef),
     ProductDef(ProductDef),
-    // SumDef(SumDef),
+    SumDef(SumDef),
     Import(Path),
+}
+
+impl Parse for Item {
+    fn is_ok(&self) -> bool {
+        match self {
+            Self::FnDef(v) => v.is_ok(),
+            Self::Import(v) => v.is_ok(),
+            Self::ProductDef(v) => v.is_ok(),
+            Self::SumDef(v) => v.is_ok(),
+        }
+    }
+
+    fn parse<'diag, 'source, 'index>(
+        mut guard: ParseGuard<'diag, 'source, 'index>,
+    ) -> ParseResult<Self> {
+        guard
+            .with(FnDef::parse)
+            .map(Self::FnDef)
+            .or_else(|_| guard.with(ProductDef::parse).map(Self::ProductDef))
+            .or_else(|_| guard.with(SumDef::parse).map(Self::SumDef))
+            .or_else(|_| guard.with(parse_import).map(Self::Import))
+    }
+}
+
+fn parse_import(mut guard: ParseGuard) -> ParseResult<Path> {
+    let import_token = guard.next_require(TokenKind::Ident)?;
+
+    if import_token.item.symbol != *IMPORT {
+        return Err(ParseError::ExpectedKw(*IMPORT, import_token.span));
+    }
+
+    guard.with(Path::parse)
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -298,7 +331,7 @@ mod tests {
     use span::Span;
 
     use crate::{
-        assert_eq,
+        Segment, assert_eq,
         expr::{BaseExpr, BinaryExpr, BinaryOp, Expr},
     };
 
@@ -327,7 +360,7 @@ mod tests {
             "pub product Vec[T] { ptr: Ptr[T], len: usize }",
             Spanned::new(
                 Span::new(0, 46),
-                ProductDef {
+                Item::ProductDef(ProductDef {
                     vis: Spanned::new(Span::new(0, 3), Visibility::Public),
                     ident: Spanned::new(Span::new(12, 15), Intern::from("Vec")),
                     generics: Some(Spanned::new(
@@ -365,7 +398,7 @@ mod tests {
                             ),
                         },
                     ],
-                },
+                }),
             ),
         );
     }
@@ -376,7 +409,7 @@ mod tests {
             "sum Result[T, E] { Ok: T, Err: E }",
             Spanned::new(
                 Span::new(0, 34),
-                SumDef {
+                Item::SumDef(SumDef {
                     vis: Spanned::new(Span::new(0, 0), Visibility::Private),
                     ident: Spanned::new(Span::new(4, 10), Intern::from("Result")),
                     generics: Some(Spanned::new(
@@ -414,7 +447,7 @@ mod tests {
                             ),
                         },
                     ],
-                },
+                }),
             ),
         )
     }
@@ -425,7 +458,7 @@ mod tests {
             "pub func add[T] { rhs: T, lhs: T }: T { rhs + lhs }",
             Spanned::new(
                 Span::new(0, 51),
-                FnDef {
+                Item::FnDef(FnDef {
                     vis: Spanned::new(Span::new(0, 3), Visibility::Public),
                     ident: Spanned::new(Span::new(9, 12), Intern::from("add")),
                     generics: Some(Spanned::new(
@@ -499,8 +532,37 @@ mod tests {
                             ))),
                         },
                     ),
-                },
+                }),
             ),
         );
+    }
+
+    #[test]
+    fn parse_import() {
+        assert_eq(
+            "import std::print",
+            Spanned::new(
+                Span::new(0, 17),
+                Item::Import(Path {
+                    segments: vec![
+                        Spanned::new(
+                            Span::new(7, 10),
+                            Segment {
+                                is_kw: false,
+                                segment: Intern::from("std"),
+                            },
+                        ),
+                        Spanned::new(
+                            Span::new(12, 17),
+                            Segment {
+                                is_kw: false,
+                                segment: Intern::from("print"),
+                            },
+                        ),
+                    ],
+                    is_fully_qualified: false,
+                }),
+            ),
+        )
     }
 }
