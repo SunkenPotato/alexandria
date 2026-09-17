@@ -1,0 +1,17 @@
+[package]
+name = "nameres"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+derive_more = { version = "2.1.1", features = ["deref", "deref_mut", "index"] }
+diagnostic = { version = "0.1.0", path = "../diagnostic" }
+index_vec = "0.1.4"
+lexer = { version = "0.1.0", path = "../lexer" }
+node = { version = "0.1.0", path = "../node" }
+parser = { version = "0.1.0", path = "../parser" }
+span = { version = "0.1.0", path = "../span" }
+source= { version = "0.1.0", path = "../source" }

@@ -1,0 +1,18 @@
+[package]
+name = "alexandria"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive", "unstable-doc"] }
+clap_derive = "4.6.4"
+diagnostic = { version = "0.1.0", path = "../diagnostic" }
+lexer = { version = "0.1.0", path = "../lexer" }
+nameres = { version = "0.1.0", path = "../nameres" }
+node = { version = "0.1.0", path = "../node" }
+parser = { version = "0.1.0", path = "../parser" }
+source = { version = "0.1.0", path = "../source" }
+span = { version = "0.1.0", path = "../span" }

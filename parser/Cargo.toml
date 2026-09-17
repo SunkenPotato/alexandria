@@ -1,0 +1,18 @@
+[package]
+name = "parser"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+dashmap = "6.2.1"
+derive_more = { version = "2.1.1", features = ["from"] }
+diagnostic = { version = "0.1.0", path = "../diagnostic" }
+lexer = { version = "0.1.0", path = "../lexer" }
+node = { version = "0.1.0", path = "../node" }
+pretty_assertions = "1.4.1"
+smallvec = "1.15.1"
+source = { version = "0.1.0", path = "../source" }
+span = { version = "0.1.0", path = "../span" }

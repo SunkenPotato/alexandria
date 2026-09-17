@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = ["alexandria", "diagnostic", "lexer", "nameres", "node", "parser", "source", "span"]
+
+[workspace.lints.rust]
+missing_docs = "warn"

@@ -1,0 +1,11 @@
+[package]
+name = "diagnostic"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+source = { version = "0.1.0", path = "../source" }
+span = { version = "0.1.0", path = "../span" }

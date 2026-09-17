@@ -1,0 +1,17 @@
+[package]
+name = "lexer"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+diagnostic = { version = "0.1.0", path = "../diagnostic" }
+internment = { version = "0.8.6", features = ["intern"] }
+source = { version = "0.1.0", path = "../source" }
+span = { version = "0.1.0", path = "../span" }
+
+[dev-dependencies]
+paste = "1.0.15"
+pretty_assertions = "1.4.1"

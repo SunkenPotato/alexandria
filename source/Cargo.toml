@@ -1,0 +1,16 @@
+[package]
+name = "source"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+derive_more = { version = "2.1.1", features = ["from"] }
+index_vec = "0.1.4"
+internment = "0.8.6"
+memchr = "2.8.0"
+memmap2 = "0.9.10"
+span = { version = "0.1.0", path = "../span" }
+thiserror = "2.0.20"

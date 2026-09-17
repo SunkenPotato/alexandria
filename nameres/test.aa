@@ -1,0 +1,18 @@
+include core;
+import core::i32;
+
+static TEST: i32 = 2020;
+
+module one {
+    import core::i32;
+
+    pub product One {
+        one: i32
+    }
+}
+
+module two {
+    import super::one::One;
+
+    static ONE: One = 5;
+}
