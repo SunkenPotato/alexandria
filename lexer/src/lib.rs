@@ -109,25 +109,21 @@ impl Token {
 }
 
 /// The lexer machinery.
-pub struct Lexer<'s, 'd> {
+pub struct Lexer<'s> {
     source_idx: SourceIdx,
     iter: Chars<'s>,
     source: &'s str,
     cursor: Cursor,
-    diagnostics: &'d mut Diagnostics,
+    diagnostics: Diagnostics,
 }
 
 /// A lexer error. This contains no information about the actual error.
 #[derive(Clone, Debug)]
 pub struct LexError;
 
-impl<'s, 'd> Lexer<'s, 'd> {
+impl<'s> Lexer<'s> {
     /// Construct a new lexer.
-    pub fn new(
-        map: &'s SourceMap,
-        source_idx: SourceIdx,
-        diagnostics: &'d mut Diagnostics,
-    ) -> Self {
+    pub fn new(map: &'s SourceMap, source_idx: SourceIdx, diagnostics: Diagnostics) -> Self {
         let source = map[source_idx].contents();
 
         Self {
@@ -213,7 +209,7 @@ impl<'s, 'd> Lexer<'s, 'd> {
     ) {
         let span = Span::new(self.cursor.committed as u32, self.cursor.cursor as u32);
         self.diagnostics.push(Diagnostic::new(
-            span,
+            Some(span),
             level,
             message.into(),
             suggestion,

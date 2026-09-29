@@ -7,8 +7,8 @@ use source::{SOURCE_EXTENSION, SourceFileError};
 use span::Spanned;
 
 use crate::{
-    CONST, FUNC, IMPORT, INCLUDE, MODULE, PRODUCT, PUBLIC, Parse, ParseError, ParseGuard,
-    ParseResult, STATIC, SUM,
+    CONST, CRATE, FUNC, IMPORT, INCLUDE, MODULE, PRODUCT, PUBLIC, Parse, ParseError, ParseGuard,
+    ParseResult, Parser, STATIC, SUM,
     expr::{Block, Expr},
     path::Path,
 };
@@ -38,11 +38,13 @@ pub enum Item {
     Module(Module),
     /// An include definition.
     Include(IncludeDef),
+    /// An include crate definition.
+    IncludeCrate(IncludeCrate),
 }
 
 impl Item {
-    pub(crate) fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
+    pub(crate) fn parse<'source, 'index>(
+        mut guard: ParseGuard<'source, 'index>,
     ) -> ParseResult<Node<Self>> {
         guard
             .spanning(FnDef::parse)
@@ -76,6 +78,11 @@ impl Item {
                 guard
                     .spanning(Import::parse)
                     .map(|x| x.map(Self::Import).into())
+            })
+            .or_else(|_| {
+                guard
+                    .spanning(IncludeCrate::parse)
+                    .map(|x| x.map(Self::IncludeCrate).into())
             })
             .or_else(|_| guard.with(Node::parse).map(|x| x.map(Self::Include)))
     }
@@ -146,9 +153,7 @@ impl Parse for GlobalDef {
         self.vis.item.is_ok() && self.ty.item.is_ok() && self.value.item.is_ok()
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        _guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(_guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         unimplemented!()
     }
 }
@@ -176,9 +181,7 @@ impl Parse for Import {
         matches!(self, Self::Ok { .. })
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let import_token = guard.next_require(TokenKind::Ident)?;
 
         if import_token.item.symbol != *IMPORT {
@@ -209,9 +212,7 @@ impl Parse for Visibility {
         true
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let Ok(ident) = guard.peek_require(TokenKind::Ident) else {
             return Ok(Self::Private);
         };
@@ -243,9 +244,7 @@ impl Parse for ProductDef {
         self.vis.item.is_ok() && self.fields.iter().all(|x| x.is_ok())
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let vis = guard.spanning(Visibility::parse)?;
         let kw = guard.next_require(TokenKind::Ident)?;
 
@@ -300,9 +299,7 @@ impl Parse for Field {
         self.ty.item.is_ok()
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
         guard.next_require(TokenKind::Colon)?;
         let ty = guard.spanning(Type::parse)?;
@@ -329,9 +326,7 @@ impl Parse for SumDef {
         self.vis.item.is_ok() && self.fields.iter().all(|x| x.is_ok())
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let vis = guard.spanning(Visibility::parse)?;
         let kw = guard.next_require(TokenKind::Ident)?;
 
@@ -386,8 +381,8 @@ impl Parse for Type {
         self.path.item.is_ok()
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+    fn parse<'source, 'index>(
+        mut guard: crate::ParseGuard<'source, 'index>,
     ) -> crate::ParseResult<Self> {
         let path = guard.spanning(Path::parse)?;
 
@@ -453,9 +448,7 @@ impl Parse for FnDef {
             && self.block.item.is_ok()
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let vis = guard.spanning(Visibility::parse)?;
         let func_kw = guard.next_require(TokenKind::Ident)?;
 
@@ -518,8 +511,8 @@ impl Parse for InlineModule {
         true
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+    fn parse<'source, 'index>(
+        mut guard: crate::ParseGuard<'source, 'index>,
     ) -> crate::ParseResult<Self> {
         let mut items = vec![];
 
@@ -547,8 +540,8 @@ impl Parse for Module {
         self.vis.item.is_ok() && self.module.is_ok()
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+    fn parse<'source, 'index>(
+        mut guard: crate::ParseGuard<'source, 'index>,
     ) -> crate::ParseResult<Self> {
         let vis = guard.spanning(Visibility::parse)?;
         let kw = guard.next_require(TokenKind::Ident)?;
@@ -603,9 +596,7 @@ impl Parse for Node<IncludeDef> {
         self.missing_semi
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let parsed: Node<_> = guard
             .spanning(|mut guard| {
                 let vis = guard.spanning(Visibility::parse)?;
@@ -676,6 +667,71 @@ impl IncludeDef {
         if let Err(e) = guard.parse_module(file_id, node_id, ident.item, is_nested) {
             e.display(guard.source_idx, guard.diagnostics);
         }
+    }
+}
+
+/// A statement to include a crate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncludeCrate {
+    /// The name of this crate
+    pub ident: Spanned<Intern<str>>,
+    /// Whether a crate ID was found for this crate.
+    pub unresolved: bool,
+}
+
+impl Parse for IncludeCrate {
+    fn is_ok(&self) -> bool {
+        !self.unresolved
+    }
+
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        let include_kw = guard.next_require(TokenKind::Ident)?;
+        if include_kw.item.symbol != *INCLUDE {
+            return Err(ParseError::ExpectedKw(*INCLUDE, include_kw.span));
+        }
+
+        let crate_kw = guard.next_require(TokenKind::Ident)?;
+        if crate_kw.item.symbol != *CRATE {
+            return Err(ParseError::ExpectedKw(*CRATE, crate_kw.span));
+        }
+
+        let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+        guard.next_require(TokenKind::Semicolon)?;
+
+        let Some(status) = guard.crate_table.status_by_name(ident.item) else {
+            guard.diagnostics.push(Diagnostic::error(
+                ident.span,
+                format!("reference to unresolved crate {}", ident.item),
+                None,
+                guard.source_idx,
+            ));
+
+            return Ok(Self {
+                ident,
+                unresolved: true,
+            });
+        };
+
+        if status.is_unclaimed() {
+            std::thread::spawn(move || {
+                let parser = Parser::new(
+                    guard.sources,
+                    status.source_idx(),
+                    guard.diagnostics,
+                    guard.ast_table,
+                    guard.crate_table,
+                    ident.item,
+                )
+                .unwrap();
+
+                parser.parse();
+            });
+        }
+
+        Ok(Self {
+            ident,
+            unresolved: false,
+        })
     }
 }
 

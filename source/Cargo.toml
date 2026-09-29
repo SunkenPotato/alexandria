@@ -7,7 +7,9 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+dashmap = "6.2.1"
 derive_more = { version = "2.1.1", features = ["from"] }
+index_boxcar_vec = { version = "0.1.0", path = "../index_boxcar_vec" }
 index_vec = "0.1.4"
 internment = "0.8.6"
 memchr = "2.8.0"

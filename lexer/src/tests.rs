@@ -10,13 +10,13 @@ fn assert(input: &str, expect: &[Spanned<Token>]) {
     let mut map = SourceMap::new();
     let source_file = SourceFile::from_memory(input.to_owned());
     let idx = map.insert(source_file);
-    let mut diagnostics = Diagnostics::default();
-    let lexer = Lexer::new(&map, idx, &mut diagnostics);
+    let diagnostics = Diagnostics::default();
+    let lexer = Lexer::new(&map, idx, diagnostics.clone());
     match lexer.lex() {
         Ok(v) => assert_eq!(v.tokens(), expect),
         Err(_) => {
             eprintln!("Failed to lex, diagnostics following: ");
-            diagnostics.write_stdout(&map).unwrap();
+            diagnostics.write_stdout(map).unwrap();
             panic!()
         }
     }

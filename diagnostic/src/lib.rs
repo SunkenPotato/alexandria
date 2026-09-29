@@ -10,6 +10,7 @@
 use std::{
     fmt::Display,
     io::{self, Write},
+    sync::{Arc, Mutex},
 };
 
 use source::{SourceIdx, SourceMap};
@@ -44,7 +45,7 @@ impl Display for DiagnosticLevel {
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     /// The span of the diagnostic.
-    pub span: Span,
+    pub span: Option<Span>,
     /// The secondary span, if any other context should be attached.
     pub secondary_span: Option<Span>,
     /// The severity of this diagnostic.
@@ -60,13 +61,13 @@ pub struct Diagnostic {
 impl Diagnostic {
     /// Create a warning diagnostic.
     pub fn warn(
-        span: Span,
+        span: impl Into<Option<Span>>,
         message: impl Into<String>,
         suggestion: Option<String>,
         source_idx: SourceIdx,
     ) -> Self {
         Self::new(
-            span,
+            span.into(),
             DiagnosticLevel::Warn,
             message.into(),
             suggestion,
@@ -76,13 +77,13 @@ impl Diagnostic {
 
     /// Create an error diagnostic.
     pub fn error(
-        span: Span,
+        span: impl Into<Option<Span>>,
         message: impl Into<String>,
         suggestion: Option<String>,
         source_idx: SourceIdx,
     ) -> Self {
         Self::new(
-            span,
+            span.into(),
             DiagnosticLevel::Error,
             message.into(),
             suggestion,
@@ -92,7 +93,7 @@ impl Diagnostic {
 
     /// Create a new diagnostic.
     pub const fn new(
-        span: Span,
+        span: Option<Span>,
         level: DiagnosticLevel,
         message: String,
         suggestion: Option<String>,
@@ -120,102 +121,103 @@ impl Diagnostic {
 /// A diagnostics pool. This is simply a monotonic wrapper around a [`Vec`].
 #[derive(Clone, Debug, Default)]
 pub struct Diagnostics {
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
 }
 
 impl Diagnostics {
     /// Merge this diagnostic pool with another one.
-    pub fn merge(&mut self, mut other: Self) {
-        self.diagnostics.append(&mut other.diagnostics);
+    pub fn merge(&mut self, other: Self) {
+        self.diagnostics
+            .lock()
+            .unwrap()
+            .append(&mut other.diagnostics.lock().unwrap());
     }
 
     /// Add a diagnostic to this pool.
     pub fn push(&mut self, diagnostic: Diagnostic) {
-        self.diagnostics.push(diagnostic)
+        self.diagnostics.lock().unwrap().push(diagnostic)
     }
 
     /// Remove all diagnostics after a certain index.
     pub fn cull(&mut self, from: usize) {
-        self.diagnostics.drain(from..);
+        self.diagnostics.lock().unwrap().drain(from..);
     }
 
     /// Retrieve the number of diagnostics in the file.
-    pub const fn len(&self) -> usize {
-        self.diagnostics.len()
+    pub fn len(&self) -> usize {
+        self.diagnostics.lock().unwrap().len()
     }
 
     /// Check whether this contains any diagnostics.
-    pub const fn is_empty(&self) -> bool {
-        self.diagnostics.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.diagnostics.lock().unwrap().is_empty()
     }
 
     /// Write all the diagnostics in this pool to a sink. This is commonly something like `stdout`.
-    pub fn write(&self, map: &SourceMap, sink: &mut dyn Write) -> std::io::Result<()> {
-        for diagnostic in &self.diagnostics {
-            let file = &map[diagnostic.source_idx];
-            let line_col = file
-                .line_col(diagnostic.span.start())
-                .expect("span should be valid");
-            let line_col_stop = file
-                .line_col(diagnostic.span.stop())
-                .expect("span should be valid");
-            // note: context != range of span!
-            let context = file.context(diagnostic.span).expect("span should be valid");
-            let source: &dyn Display = match file.source() {
-                Some(v) => &v.display() as &dyn Display,
-                None => &"tmp",
-            };
-
+    pub fn write(&self, map: SourceMap, sink: &mut dyn Write) -> std::io::Result<()> {
+        for diagnostic in &*self.diagnostics.lock().unwrap() {
             writeln!(sink, "{}: {}", diagnostic.level, diagnostic.message)?;
-            writeln!(
-                sink,
-                " -> {}:{}:{}:",
-                source, line_col.line, line_col.column
-            )?;
 
-            for (idx, line) in context.lines().enumerate() {
-                let line_n = line_col.line + idx as u32;
-                writeln!(sink, "{:>5} | {}", line_n, line)?;
-                let underline_start = if line_n == line_col.line {
-                    line_col.column
-                } else {
-                    0
+            if let Some(span) = diagnostic.span {
+                let file = &map[diagnostic.source_idx];
+                let line_col = file.line_col(span.start()).expect("span should be valid");
+                let line_col_stop = file.line_col(span.stop()).expect("span should be valid");
+                // note: context != range of span!
+                let context = file.context(span).expect("span should be valid");
+                let source: &dyn Display = match file.source() {
+                    Some(v) => &v.display() as &dyn Display,
+                    None => &"tmp",
                 };
+                writeln!(
+                    sink,
+                    " -> {}:{}:{}:",
+                    source, line_col.line, line_col.column
+                )?;
 
-                let underline_stop = if line_n == line_col_stop.line {
-                    line_col_stop.column
-                } else {
-                    line.len() as u32
-                };
-
-                write!(sink, "----- | ")?;
-                for _ in 0..underline_start {
-                    write!(sink, " ")?;
-                }
-
-                for _ in 0..(underline_stop - underline_start) {
-                    write!(sink, "^")?;
-                }
-
-                writeln!(sink, "\n")?;
-            }
-
-            if let Some(sec_span) = diagnostic.secondary_span {
-                let context = file
-                    .context(sec_span)
-                    .expect("secondary span should be valid");
-                let line_col = file
-                    .line_col(sec_span.start())
-                    .expect("secondary span should be valid");
-
-                writeln!(sink, "additional context:")?;
                 for (idx, line) in context.lines().enumerate() {
-                    writeln!(sink, "{:>5} | {}", line_col.line + idx as u32, line)?;
-                }
-            }
+                    let line_n = line_col.line + idx as u32;
+                    writeln!(sink, "{:>5} | {}", line_n, line)?;
+                    let underline_start = if line_n == line_col.line {
+                        line_col.column
+                    } else {
+                        0
+                    };
 
-            if let Some(suggestion) = &diagnostic.suggestion {
-                writeln!(sink, "suggestion: {suggestion}")?;
+                    let underline_stop = if line_n == line_col_stop.line {
+                        line_col_stop.column
+                    } else {
+                        line.len() as u32
+                    };
+
+                    write!(sink, "----- | ")?;
+                    for _ in 0..underline_start {
+                        write!(sink, " ")?;
+                    }
+
+                    for _ in 0..(underline_stop - underline_start) {
+                        write!(sink, "^")?;
+                    }
+
+                    writeln!(sink, "\n")?;
+                }
+
+                if let Some(sec_span) = diagnostic.secondary_span {
+                    let context = file
+                        .context(sec_span)
+                        .expect("secondary span should be valid");
+                    let line_col = file
+                        .line_col(sec_span.start())
+                        .expect("secondary span should be valid");
+
+                    writeln!(sink, "additional context:")?;
+                    for (idx, line) in context.lines().enumerate() {
+                        writeln!(sink, "{:>5} | {}", line_col.line + idx as u32, line)?;
+                    }
+                }
+
+                if let Some(suggestion) = &diagnostic.suggestion {
+                    writeln!(sink, "suggestion: {suggestion}")?;
+                }
             }
         }
 
@@ -223,14 +225,14 @@ impl Diagnostics {
     }
 
     /// A shorthand for `self.write(map, &mut io::stderr().lock())`.
-    pub fn write_stderr(&self, map: &SourceMap) -> std::io::Result<()> {
+    pub fn write_stderr(&self, map: SourceMap) -> std::io::Result<()> {
         let mut stderr = io::stderr().lock();
 
         self.write(map, &mut stderr)
     }
 
     /// A shorthand for `self.write(map, &mut io::stdout().lock())`.
-    pub fn write_stdout(&self, map: &SourceMap) -> std::io::Result<()> {
+    pub fn write_stdout(&self, map: SourceMap) -> std::io::Result<()> {
         let mut stdout = io::stdout().lock();
 
         self.write(map, &mut stdout)

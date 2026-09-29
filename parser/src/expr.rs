@@ -30,9 +30,7 @@ impl Parse for Expr {
         }
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         Self::parse_1(guard, 0)
     }
 }
@@ -118,8 +116,8 @@ impl Parse for BinaryOp {
         true
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+    fn parse<'source, 'index>(
+        mut guard: crate::ParseGuard<'source, 'index>,
     ) -> crate::ParseResult<Self> {
         let next = guard.next()?;
         let op = match next.item.kind {
@@ -258,8 +256,8 @@ impl Parse for BaseExpr {
         }
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+    fn parse<'source, 'index>(
+        mut guard: crate::ParseGuard<'source, 'index>,
     ) -> crate::ParseResult<Self> {
         if guard.next_require(TokenKind::LParen).is_ok() {
             let expr = Box::new(guard.with(Expr::parse)?);
@@ -386,8 +384,8 @@ pub mod literal {
             }
         }
 
-        fn parse<'diag, 'source, 'index, 'a>(
-            guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+        fn parse<'source, 'index>(
+            guard: crate::ParseGuard<'source, 'index>,
         ) -> crate::ParseResult<Self> {
             let next = guard.peek()?;
             match next.item.kind {
@@ -415,8 +413,8 @@ pub mod literal {
             matches!(self, Self::Ok(..))
         }
 
-        fn parse<'diag, 'source, 'index, 'a>(
-            mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+        fn parse<'source, 'index>(
+            mut guard: crate::ParseGuard<'source, 'index>,
         ) -> crate::ParseResult<Self> {
             let next = guard.next_require(TokenKind::Integer)?;
             let Some(int) = next.item.symbol.chars().try_fold(0u128, |c, next| {
@@ -451,8 +449,8 @@ pub mod literal {
             matches!(self, Self::Ok(..))
         }
 
-        fn parse<'diag, 'source, 'index, 'a>(
-            mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+        fn parse<'source, 'index>(
+            mut guard: crate::ParseGuard<'source, 'index>,
         ) -> crate::ParseResult<Self> {
             let token = guard.next_require(TokenKind::StringLit)?;
             let mut buf = String::with_capacity(token.item.symbol.len());
@@ -524,9 +522,7 @@ impl Parse for Block {
             && self.tail.as_ref().is_none_or(|x| x.item.is_ok())
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         guard.next_require(TokenKind::LCurly)?;
         let mut stmts = vec![];
         loop {
@@ -581,9 +577,7 @@ impl Parse for ConditionalExpr {
             && self.fallback.as_ref().is_none_or(|x| x.item.is_ok())
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let main = guard.spanning(ConditionalBlock::parse)?;
         let mut alternatives = vec![];
 
@@ -638,9 +632,7 @@ impl Parse for ConditionalBlock {
         self.condition.item.is_ok() && self.block.item.is_ok()
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let kw = guard.next_require(TokenKind::Ident)?;
         if kw.item.symbol != *IF {
             return Err(ParseError::ExpectedKw(kw.item.symbol, kw.span));

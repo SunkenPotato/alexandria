@@ -5,7 +5,9 @@ use std::{collections::HashMap, iter::once};
 use diagnostic::{Diagnostic, Diagnostics};
 use node::{Node, NodeId};
 use parser::{
-    AstTable, CRATE, SUPER,
+    CRATE, SUPER,
+    ast_table::AstTable,
+    crate_table::CrateTable,
     expr::{BaseExpr, Block, Expr},
     item::{
         FnDef, GlobalDef, GlobalDefKind, IncludeDef, InlineModule, Item, ProductDef, SumDef, Type,
@@ -41,6 +43,7 @@ pub struct Resolver<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast> {
     resolutions: &'res mut ResolutionTable,
     entrypoint: SourceIdx,
     ast_table: &'ast AstTable,
+    crate_table: CrateTable,
     imports: Vec<(*const Path, ScopeId)>,
     root: ScopeId,
 }
@@ -58,6 +61,7 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
     Resolver<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
 {
     /// Create a new resolver.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         arena: &'arena mut ScopeArena,
         nrt: &'nrt mut NameResTable,
@@ -65,6 +69,7 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
         diagnostics: &'diag mut Diagnostics,
         resolutions: &'res mut ResolutionTable,
         ast_table: &'ast AstTable,
+        crate_table: CrateTable,
         entrypoint: SourceIdx,
     ) -> Self {
         let root = arena.create_scope(None, Some(entrypoint));
@@ -77,6 +82,7 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
             resolutions,
             entrypoint,
             ast_table,
+            crate_table,
             root,
             imports: vec![],
         }
@@ -139,6 +145,9 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
             Item::ProductDef(prod) => self.register_prod_def(item.map(|_| prod), scope),
             Item::SumDef(sum) => self.register_sum_def(item.map(|_| sum), scope),
             Item::Include(include) => self.register_include(item.map(|_| include), scope),
+            Item::IncludeCrate(include) => {
+                self.register_include_crate(item.map(|_| include), scope)
+            }
         }
     }
 
@@ -336,6 +345,37 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
 
         self.register_module(&self.ast_table.by_node_id(include.id()).items, subscope);
     }
+
+    /// Register an `include crate ...;` definition and the underlying crate.
+    pub fn register_include_crate(
+        &mut self,
+        include: Node<&parser::item::IncludeCrate>,
+        scope: ScopeId,
+    ) {
+        if include.unresolved {
+            return;
+        }
+
+        let source = self
+            .crate_table
+            .status_by_name(include.ident.item)
+            .unwrap()
+            .source_idx();
+
+        let ast = self.ast_table.by_src(source);
+
+        let subscope = self.arena.create_scope(None, Some(source));
+        self.subscopes.table.insert(include.id(), subscope);
+
+        self.arena.scopes[scope].types.insert(
+            include.item.ident.item,
+            self.nrt
+                .table
+                .push(SymbolInfo::new(SymbolKind::Module(subscope))),
+        );
+
+        self.register_module(&ast.items, subscope);
+    }
 }
 
 /////////////////////////////////////////////////////
@@ -500,6 +540,7 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
             Item::ProductDef(prod_def) => self.resolve_prod_def(item.map(|_| prod_def), scope),
             Item::SumDef(sum_def) => self.resolve_sum_def(item.map(|_| sum_def), scope),
             Item::Include(include) => self.resolve_include(item.map(|_| include)),
+            Item::IncludeCrate(include) => self.resolve_include_crate(item.map(|_| include)),
         }
     }
 
@@ -633,5 +674,22 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
         if let Some(tail) = &block.tail {
             self.resolve_expr(tail, subscope);
         }
+    }
+
+    fn resolve_include_crate(&mut self, include: Node<&parser::item::IncludeCrate>) {
+        if include.unresolved {
+            return;
+        }
+
+        let source_idx = self
+            .crate_table
+            .status_by_name(include.item.ident.item)
+            .unwrap()
+            .source_idx();
+
+        let ast = self.ast_table.by_src(source_idx);
+        let subscope = self.subscopes.table[&include.id()];
+
+        self.resolve_module(&ast, subscope);
     }
 }

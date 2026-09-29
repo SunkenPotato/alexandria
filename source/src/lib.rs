@@ -10,7 +10,6 @@ pub static SOURCE_EXTENSION: &str = "aa";
 pub static ROOT_FILES: &[&str] = &["main", "mod"];
 
 use std::{
-    collections::HashMap,
     fs::File,
     io::{self, Seek},
     ops::Deref,
@@ -20,7 +19,9 @@ use std::{
     sync::Arc,
 };
 
-use index_vec::{IndexVec, define_index_type};
+use dashmap::DashMap;
+use index_boxcar_vec::IndexBoxcarVec;
+use index_vec::define_index_type;
 use internment::Intern;
 use memchr::Memchr;
 use memmap2::Mmap;
@@ -254,10 +255,15 @@ define_index_type! {
 }
 
 /// A map of source files.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct SourceMap {
-    map: IndexVec<SourceIdx, SourceFile>,
-    path_index: HashMap<Arc<Path>, SourceIdx>,
+    raw: Arc<SourceMapRef>,
+}
+
+#[derive(Default, Debug)]
+struct SourceMapRef {
+    map: index_boxcar_vec::IndexBoxcarVec<SourceIdx, SourceFile>,
+    path_index: DashMap<Arc<Path>, SourceIdx>,
 }
 
 impl SourceMap {
@@ -269,9 +275,9 @@ impl SourceMap {
     /// Insert a source file into the map. This also updates the path index.
     pub fn insert(&mut self, file: SourceFile) -> SourceIdx {
         let path = file.source.clone();
-        let idx = self.map.push(file);
+        let idx = self.raw.map.push(file);
         if let Some(path) = path {
-            self.path_index.insert(path, idx);
+            self.raw.path_index.insert(path, idx);
         }
 
         idx
@@ -305,7 +311,7 @@ impl SourceMap {
 
     /// Lookup a path for a source file.
     pub fn lookup(&self, path: &Path) -> Option<SourceIdx> {
-        self.path_index.get(path).copied()
+        self.raw.path_index.get(path).as_deref().copied()
     }
 
     /// Fill the current source map with all relevant files in the given directory.
@@ -338,10 +344,10 @@ impl SourceMap {
 }
 
 impl Deref for SourceMap {
-    type Target = IndexVec<SourceIdx, SourceFile>;
+    type Target = IndexBoxcarVec<SourceIdx, SourceFile>;
 
     fn deref(&self) -> &Self::Target {
-        &self.map
+        &self.raw.map
     }
 }
 

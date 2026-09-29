@@ -10,6 +10,7 @@ workspace = true
 dashmap = "6.2.1"
 derive_more = { version = "2.1.1", features = ["from"] }
 diagnostic = { version = "0.1.0", path = "../diagnostic" }
+index_vec = "0.1.4"
 lexer = { version = "0.1.0", path = "../lexer" }
 node = { version = "0.1.0", path = "../node" }
 pretty_assertions = "1.4.1"

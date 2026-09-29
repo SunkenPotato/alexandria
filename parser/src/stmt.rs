@@ -33,8 +33,8 @@ impl Parse for Stmt {
         }
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+    fn parse<'source, 'index>(
+        mut guard: crate::ParseGuard<'source, 'index>,
     ) -> crate::ParseResult<Self> {
         guard.with(Item::parse).map(Self::Item).or_else(|_| {
             guard.with(Binding::parse).map(Self::Binding).or_else(|_| {
@@ -66,8 +66,8 @@ impl Parse for Binding {
         true
     }
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
+    fn parse<'source, 'index>(
+        mut guard: crate::ParseGuard<'source, 'index>,
     ) -> crate::ParseResult<Self> {
         let decl = guard.next_require(TokenKind::Ident)?;
         if decl.item.symbol != *DECL {

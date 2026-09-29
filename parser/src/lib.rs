@@ -7,7 +7,6 @@ pub mod stmt;
 
 use std::rc::Rc;
 
-use dashmap::DashMap;
 use derive_more::From;
 use diagnostic::{Diagnostic, Diagnostics};
 use lexer::{Intern, LexError, Lexer, Token, TokenKind};
@@ -16,7 +15,11 @@ use smallvec::SmallVec;
 use source::{ModuleTree, SourceIdx, SourceMap};
 use span::{Span, Spanned};
 
-use crate::item::{InlineModule, Item};
+use crate::{
+    ast_table::AstTable,
+    crate_table::{CrateParseClaim, CrateTable},
+    item::{InlineModule, Item},
+};
 
 /// A specialized `Result<T, ParseError>`
 pub type ParseResult<T> = std::result::Result<T, ParseError>;
@@ -59,49 +62,252 @@ keywords! {
     CRATE = "crate"
 }
 
-/// A collection of AST, grouped by file.
-#[derive(Debug, Default)]
-pub struct AstTable {
-    /// The source-AST relation.
-    source_map: DashMap<SourceIdx, InlineModule>,
-    /// The node-source relation.
-    node_map: DashMap<NodeId, SourceIdx>,
+/// Implementation of the [`AstTable`].
+pub mod ast_table {
+    use std::sync::Arc;
+
+    use dashmap::DashMap;
+    use node::NodeId;
+    use source::SourceIdx;
+
+    use crate::item::InlineModule;
+
+    /// A collection of AST, grouped by file.
+    #[derive(Clone, Debug, Default)]
+    pub struct AstTable {
+        raw: Arc<AstTableRef>,
+    }
+
+    #[derive(Debug, Default)]
+    struct AstTableRef {
+        /// The source-AST relation.
+        source_map: DashMap<SourceIdx, InlineModule>,
+        /// The node-source relation.
+        node_map: DashMap<NodeId, SourceIdx>,
+    }
+
+    impl AstTable {
+        /// Retrieve the AST of a given file.
+        ///
+        /// # Panics
+        /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
+        pub fn by_src(
+            &self,
+            k: SourceIdx,
+        ) -> dashmap::mapref::one::Ref<'_, SourceIdx, InlineModule> {
+            self.raw.source_map.get(&k).unwrap()
+        }
+
+        /// Retrieve the AST of a given node.
+        ///
+        /// # Panics
+        /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
+        pub fn by_node_id(
+            &self,
+            k: NodeId,
+        ) -> dashmap::mapref::one::Ref<'_, SourceIdx, InlineModule> {
+            self.by_src(self.source_idx(k))
+        }
+
+        /// Retrieve the source ID of a node.
+        ///
+        /// # Panics
+        /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
+        pub fn source_idx(&self, k: NodeId) -> SourceIdx {
+            *self.raw.node_map.get(&k).unwrap()
+        }
+
+        /// Add an AST to the table.
+        pub fn insert(&self, source: SourceIdx, node: NodeId, data: InlineModule) {
+            self.raw.source_map.insert(source, data);
+            self.raw.node_map.insert(node, source);
+        }
+
+        /// Check whether the table is empty.
+        pub fn is_empty(&self) -> bool {
+            self.raw.source_map.is_empty()
+        }
+    }
 }
 
-impl AstTable {
-    /// Retrieve the AST of a given file.
+/// Implementation of the [`CrateTable`].
+pub mod crate_table {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, OnceLock},
+    };
+
+    use index_vec::IndexVec;
+    use lexer::Intern;
+    use source::SourceIdx;
+
+    use crate::ParseError;
+
+    index_vec::define_index_type! {
+        /// A unique identifier for a crate.
+        pub struct CrateId = u32;
+    }
+
+    type Lock = Arc<OnceLock<Result<(), ParseError>>>;
+
+    // Private to ensure proper state transitions.
+    #[derive(Clone, Debug)]
+    enum CrateStatusRaw {
+        /// The job has not yet been claimed by a thread. It is free to claim and may be claimed with [`CrateStatus::claim`].
+        Unclaimed { source: SourceIdx },
+        /// The job has either been completed or is being completed by a thread.
+        Processed { value: Lock, source: SourceIdx },
+    }
+
+    /// The status of the parsing of an entire crate.
     ///
-    /// # Panics
-    /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
-    pub fn by_src(&self, k: SourceIdx) -> dashmap::mapref::one::Ref<'_, SourceIdx, InlineModule> {
-        self.source_map.get(&k).unwrap()
-    }
-
-    /// Retrieve the AST of a given node.
+    /// To obtain the [`SourceIdx`] of the crate, use [`CrateStatus::get`].
     ///
-    /// # Panics
-    /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
-    pub fn by_node_id(&self, k: NodeId) -> dashmap::mapref::one::Ref<'_, SourceIdx, InlineModule> {
-        self.by_src(self.source_idx(k))
+    /// To claim the job, use [`CrateStatus::claim`].
+    #[derive(Clone, Debug)]
+    pub struct CrateStatus {
+        raw: CrateStatusRaw,
     }
 
-    /// Retrieve the source ID of a node.
-    ///
-    /// # Panics
-    /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
-    pub fn source_idx(&self, k: NodeId) -> SourceIdx {
-        *self.node_map.get(&k).unwrap()
+    /// A claim issued to a thread willing to parse a crate.
+    #[derive(Debug)]
+    pub struct CrateParseClaim {
+        source_idx: SourceIdx,
+        lock: Arc<OnceLock<Result<(), ParseError>>>,
     }
 
-    /// Add an AST to the table.
-    pub fn insert(&self, source: SourceIdx, node: NodeId, data: InlineModule) {
-        self.source_map.insert(source, data);
-        self.node_map.insert(node, source);
+    impl CrateParseClaim {
+        const fn new(source_idx: SourceIdx, lock: Lock) -> Self {
+            Self { source_idx, lock }
+        }
+
+        /// Obtain the source ID of the entrypoint to parse.
+        pub fn source_idx(&self) -> SourceIdx {
+            self.source_idx
+        }
+
+        /// Submit the parse result and mark the crate as parsed.
+        pub fn finish(self, result: Result<(), ParseError>) {
+            self.lock.set(result).unwrap();
+        }
     }
 
-    /// Check whether the table is empty.
-    pub fn is_empty(&self) -> bool {
-        self.source_map.is_empty()
+    impl CrateStatus {
+        /// Returns `true` if the crate status is [`Unclaimed`].
+        ///
+        /// [`Unclaimed`]: CrateStatus::Unclaimed
+        #[must_use]
+        pub fn is_unclaimed(&self) -> bool {
+            matches!(self.raw, CrateStatusRaw::Unclaimed { .. })
+        }
+
+        /// Claim the job, if available. The caller is expected to place the [`SourceIdx`] back into the provided
+        /// [`OnceLock`] once—and only once completed. The caller is also expected to place the parsed AST into the [`AstTable`].
+        pub fn claim(&mut self) -> Option<CrateParseClaim> {
+            match self.raw {
+                CrateStatusRaw::Unclaimed { source } => {
+                    let lock = Arc::new(OnceLock::new());
+                    self.raw = CrateStatusRaw::Processed {
+                        value: Arc::clone(&lock),
+                        source,
+                    };
+                    Some(CrateParseClaim::new(source, lock))
+                }
+                CrateStatusRaw::Processed { .. } => None,
+            }
+        }
+
+        /// Retrieve the [`SourceIdx`], if the crate has successfully been parsed.
+        pub fn get(&self) -> Option<&Result<(), ParseError>> {
+            match &self.raw {
+                CrateStatusRaw::Unclaimed { .. } => None,
+                CrateStatusRaw::Processed { value, .. } => value.get(),
+            }
+        }
+
+        /// Create a new [`CrateStatus`] that has not been processed.
+        pub const fn new(source: SourceIdx) -> Self {
+            Self {
+                raw: CrateStatusRaw::Unclaimed { source },
+            }
+        }
+
+        /// Create a new [`CrateStatus`] that has been processed.
+        pub fn processed(source: SourceIdx) -> Self {
+            Self {
+                raw: CrateStatusRaw::Processed {
+                    value: Arc::new(OnceLock::from(Ok(()))),
+                    source,
+                },
+            }
+        }
+
+        /// Retrieve the [`SourceIdx`] of this [`CrateStatus`].
+        pub fn source_idx(&self) -> SourceIdx {
+            match self.raw {
+                CrateStatusRaw::Unclaimed { source } | CrateStatusRaw::Processed { source, .. } => {
+                    source
+                }
+            }
+        }
+    }
+
+    /// A registry for crates.
+    #[derive(Clone, Debug, Default)]
+    pub struct CrateTable {
+        raw: Arc<Mutex<CrateTableRaw>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct CrateTableRaw {
+        crate_table: IndexVec<CrateId, CrateStatus>,
+        name_table: HashMap<Intern<str>, CrateId>,
+    }
+
+    impl CrateTable {
+        /// Retrieve the status and information stored about this crate.
+        pub fn status(&self, id: CrateId) -> CrateStatus {
+            self.raw.lock().unwrap().crate_table[id].clone()
+        }
+
+        /// Attempt to retrieve the crate by it's name.
+        pub fn status_by_name(&self, name: Intern<str>) -> Option<CrateStatus> {
+            let raw = self.raw.lock().unwrap();
+            raw.name_table
+                .get(&name)
+                .map(|&id| raw.crate_table[id].clone())
+        }
+
+        /// Attempt to retrieve the crate ID by it's name.
+        pub fn id_by_name(&self, name: Intern<str>) -> Option<CrateId> {
+            self.raw.lock().unwrap().name_table.get(&name).copied()
+        }
+
+        /// Directly insert a parsed crate.
+        pub fn insert_processed(&self, name: Intern<str>, id: SourceIdx) -> Option<CrateId> {
+            let mut lock = self.raw.lock().unwrap();
+
+            if lock.name_table.contains_key(&name) {
+                None
+            } else {
+                let id = lock.crate_table.push(CrateStatus::processed(id));
+                lock.name_table.insert(name, id);
+                Some(id)
+            }
+        }
+
+        /// Insert a crate parse job.
+        pub fn insert(&self, name: Intern<str>, id: SourceIdx) -> bool {
+            let mut lock = self.raw.lock().unwrap();
+
+            if lock.name_table.contains_key(&name) {
+                false
+            } else {
+                let id = lock.crate_table.push(CrateStatus::new(id));
+                lock.name_table.insert(name, id);
+                true
+            }
+        }
     }
 }
 
@@ -127,7 +333,7 @@ pub enum ParseError {
 impl ParseError {
     /// Convert this error into a diagnostic and add it to the given pool.
     #[track_caller]
-    pub fn display(&self, source: SourceIdx, diag: &mut Diagnostics) {
+    pub fn display(&self, source: SourceIdx, mut diag: Diagnostics) {
         match self {
             ParseError::ExpectedKw(kw, span) => {
                 diag.push(Diagnostic::error(
@@ -171,44 +377,67 @@ impl ParseError {
 }
 
 /// The parser. See [`Parser::parse`].
-pub struct Parser<'s, 'd, 'a> {
+pub struct Parser {
     entrypoint: SourceIdx,
-    sources: &'s mut SourceMap,
-    diagnostics: &'d mut Diagnostics,
-    ast_table: &'a AstTable,
+    sources: SourceMap,
+    diagnostics: Diagnostics,
+    ast_table: AstTable,
+    crate_table: CrateTable,
+    claim: CrateParseClaim,
 }
 
-impl<'s, 'd, 'a> Parser<'s, 'd, 'a> {
-    /// Create a new parser to parse the given source file as the entrypoint.
+impl Parser {
+    /// Create a new parser to parse the given source file as the entrypoint for a crate.
     pub fn new(
-        sources: &'s mut SourceMap,
+        sources: SourceMap,
         entrypoint: SourceIdx,
-        diagnostics: &'d mut Diagnostics,
-        ast_table: &'a AstTable,
-    ) -> Self {
-        Self {
+        mut diagnostics: Diagnostics,
+        ast_table: AstTable,
+        crate_table: CrateTable,
+        name: Intern<str>,
+    ) -> Option<Self> {
+        let Some(id) = crate_table.insert_processed(name, entrypoint) else {
+            diagnostics.push(Diagnostic::error(
+                None::<Span>,
+                "a crate with the name `{}` already exists",
+                None,
+                entrypoint,
+            ));
+
+            return None;
+        };
+
+        Some(Self {
             sources,
             entrypoint,
             diagnostics,
             ast_table,
-        }
+            claim: crate_table.status(id).claim().unwrap(),
+            crate_table,
+        })
     }
 
     /// Parse the specified input. This mutates the AST table instead of returning the result.
-    pub fn parse(self) -> ParseResult<()> {
-        let lexed = Lexer::new(self.sources, self.entrypoint, self.diagnostics).lex()?;
+    pub fn parse(mut self) {
+        let res = self.parse_1();
+        self.claim.finish(res);
+    }
+
+    fn parse_1(&mut self) -> ParseResult<()> {
+        let lexed = Lexer::new(&self.sources, self.entrypoint, self.diagnostics.clone()).lex()?;
         let mut guard = ParseGuard {
-            diagnostics: self.diagnostics,
+            diagnostics: self.diagnostics.clone(),
             index: &mut 0,
             committed: 0,
             diag_len: 0,
             stream: lexed.tokens(),
             source_idx: self.entrypoint,
-            ast_table: self.ast_table,
+            ast_table: self.ast_table.clone(),
+            crate_table: self.crate_table.clone(),
             module_tree: ModuleTree::new(
                 self.sources[self.entrypoint].source().unwrap().to_owned(),
             ),
-            sources: self.sources,
+            sources: self.sources.clone(),
         };
 
         guard.commit_diag();
@@ -255,25 +484,26 @@ impl<'s, 'd, 'a> Parser<'s, 'd, 'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn guard<'gd, 'gs, 'this>(
+    pub(crate) fn guard<'s, 'gs, 'this>(
         &'this mut self,
         stream: &'s [Spanned<Token>],
-    ) -> ParseGuard<'gd, 'gs, 'static, 'a>
+    ) -> ParseGuard<'gs, 'static>
     where
-        'this: 'gd + 'gs,
+        'this: 'gs,
         's: 'gs,
     {
         use std::path::PathBuf;
 
-        ParseGuard::<'gd, 'gs, 'static, 'a> {
+        ParseGuard::<'gs, 'static> {
             diag_len: self.diagnostics.len(),
-            diagnostics: self.diagnostics,
+            diagnostics: self.diagnostics.clone(),
             // ONLY because this is #[cfg(test)]
             index: Box::leak(Box::new(0)),
             committed: 0,
             source_idx: self.entrypoint,
-            sources: self.sources,
-            ast_table: self.ast_table,
+            sources: self.sources.clone(),
+            ast_table: self.ast_table.clone(),
+            crate_table: self.crate_table.clone(),
             module_tree: ModuleTree::new(PathBuf::new()),
             stream,
         }
@@ -282,39 +512,40 @@ impl<'s, 'd, 'a> Parser<'s, 'd, 'a> {
 
 /// A parser guard for parsing a specific element.
 #[derive(Debug)]
-pub struct ParseGuard<'d, 's, 'i, 'a> {
-    diagnostics: &'d mut Diagnostics,
+pub struct ParseGuard<'s, 'i> {
+    diagnostics: Diagnostics,
     index: &'i mut usize,
     committed: usize,
     diag_len: usize,
     stream: &'s [Spanned<Token>],
     source_idx: SourceIdx,
-    sources: &'s mut SourceMap,
-    ast_table: &'a AstTable,
+    sources: SourceMap,
+    ast_table: AstTable,
+    crate_table: CrateTable,
     module_tree: Rc<ModuleTree>,
 }
 
-impl<'d, 's, 'i, 'a> ParseGuard<'d, 's, 'i, 'a> {
+impl<'s, 'i> ParseGuard<'s, 'i> {
     fn subguard<'d2, 's2, 'i2, 'this>(
         &'this mut self,
         index: &'i2 mut usize,
         stream: Option<&'s2 [Spanned<Token>]>,
         source: Option<SourceIdx>,
-    ) -> ParseGuard<'d2, 's2, 'i2, 'a>
+    ) -> ParseGuard<'s2, 'i2>
     where
-        'd: 'd2,
         's: 's2,
         'i: 'i2,
         'this: 'd2 + 'i2 + 's2,
     {
         ParseGuard {
             diag_len: self.diagnostics.len(),
-            diagnostics: &mut *self.diagnostics,
+            diagnostics: self.diagnostics.clone(),
             committed: *self.index,
             stream: stream.unwrap_or(self.stream),
             source_idx: source.unwrap_or(self.source_idx),
-            sources: self.sources,
-            ast_table: self.ast_table,
+            sources: self.sources.clone(),
+            ast_table: self.ast_table.clone(),
+            crate_table: self.crate_table.clone(),
             module_tree: Rc::clone(&self.module_tree),
             index,
         }
@@ -431,7 +662,7 @@ impl<'d, 's, 'i, 'a> ParseGuard<'d, 's, 'i, 'a> {
     /// This function does not commit the result if `f` returns an error.
     pub fn spanning<F, T, E>(&mut self, f: F) -> Result<Spanned<T>, E>
     where
-        for<'d2, 's2, 'i2> F: FnOnce(ParseGuard<'d2, 's2, 'i2, 'a>) -> Result<T, E>,
+        for<'s2, 'i2> F: FnOnce(ParseGuard<'s2, 'i2>) -> Result<T, E>,
     {
         let mut index = *self.index;
         let guard = self.subguard(&mut index, None, None);
@@ -459,7 +690,7 @@ impl<'d, 's, 'i, 'a> ParseGuard<'d, 's, 'i, 'a> {
     /// Execute a parser and commit the result if it exits successfully.
     pub fn with<F, T, E>(&mut self, f: F) -> Result<T, E>
     where
-        for<'d2, 's2, 'i2> F: FnOnce(ParseGuard<'d2, 's2, 'i2, 'a>) -> Result<T, E>,
+        for<'s2, 'i2> F: FnOnce(ParseGuard<'s2, 'i2>) -> Result<T, E>,
     {
         let mut index = *self.index;
         let guard = self.subguard(&mut index, None, None);
@@ -485,7 +716,7 @@ impl<'d, 's, 'i, 'a> ParseGuard<'d, 's, 'i, 'a> {
         subdir: bool,
     ) -> ParseResult<()> {
         let mut index = *self.index;
-        let lexed = Lexer::new(self.sources, source, self.diagnostics).lex()?;
+        let lexed = Lexer::new(&self.sources, source, self.diagnostics.clone()).lex()?;
 
         let parent = Rc::clone(&self.module_tree);
         let mut guard = self.subguard(&mut index, Some(lexed.tokens()), Some(source));
@@ -523,9 +754,13 @@ pub mod path {
     /// A path segment.
     #[derive(Clone, Copy, PartialEq)]
     pub struct Segment {
+        // SAFETY: this is a pointer to an interned string
         ptr: *const u8,
         tagged_len: usize,
     }
+
+    unsafe impl Send for Segment {}
+    unsafe impl Sync for Segment {}
 
     impl Segment {
         /// The position of the `is_kw` bit.
@@ -555,6 +790,7 @@ pub mod path {
                 assert!(size_of::<&'static str>() == size_of::<Intern<str>>());
             }
 
+            // SAFETY: Intern<str> is simply a wrapper around &'static str. equality check occurs above.
             unsafe { core::mem::transmute(&**self) }
         }
     }
@@ -609,9 +845,7 @@ pub mod path {
             self.segments.iter().all(|x| !x.item.is_kw())
         }
 
-        fn parse<'diag, 'source, 'index, 'a>(
-            mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-        ) -> ParseResult<Self> {
+        fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
             // using new guard so that it's atomic
             let is_fully_qualified = guard.spanning(consume_double_colon).is_ok();
             let first = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
@@ -647,9 +881,7 @@ pub mod path {
 /// A parser.
 pub trait Parse: Sized {
     /// Attempt to parse an item.
-    fn parse<'diag, 'source, 'index, 'a>(
-        guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self>;
+    fn parse<'source, 'index>(guard: ParseGuard<'source, 'index>) -> ParseResult<Self>;
 
     /// Specify which state of this can be interpreted as a successfully parsed element.
     fn is_ok(&self) -> bool;
@@ -679,17 +911,26 @@ where
     let source_idx = sources.insert(source_file);
     let mut diagnostics = Diagnostics::default();
 
-    let lexed = match Lexer::new(&sources, source_idx, &mut diagnostics).lex() {
+    let lexed = match Lexer::new(&sources, source_idx, diagnostics.clone()).lex() {
         Ok(r) => r,
         Err(_) => {
             eprintln!("Failed to lex input, diagnostics following: ");
-            diagnostics.write_stderr(&sources).unwrap();
+            diagnostics.write_stderr(sources).unwrap();
             panic!()
         }
     };
 
     let ast_table = AstTable::default();
-    let mut parser = Parser::new(&mut sources, source_idx, &mut diagnostics, &ast_table);
+    let crate_table = CrateTable::default();
+    let mut parser = Parser::new(
+        sources.clone(),
+        source_idx,
+        diagnostics.clone(),
+        ast_table.clone(),
+        crate_table,
+        Intern::from("test"),
+    )
+    .unwrap();
     let mut guard = parser.guard(lexed.tokens());
 
     // prob not the best way to do this
@@ -698,14 +939,14 @@ where
 
         if *guard.index != lexed.tokens().len() {
             ParseError::InputNotConsumed(lexed.tokens().last().unwrap().span)
-                .display(source_idx, &mut diagnostics);
+                .display(source_idx, diagnostics.clone());
         }
 
         let parse_res = match parse_res {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("Failed to parse input. Error: {e:#?}. Diagnostics: ");
-                diagnostics.write_stdout(&sources).unwrap();
+                diagnostics.write_stdout(sources).unwrap();
                 panic!();
             }
         };
@@ -718,7 +959,7 @@ where
             Ok(v) => v,
             Err(e) => {
                 eprintln!("Failed to parse input. Error: {e:#?}. Diagnostics: ");
-                diagnostics.write_stdout(&sources).unwrap();
+                diagnostics.write_stdout(sources).unwrap();
                 panic!();
             }
         };
