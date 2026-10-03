@@ -1,0 +1,4 @@
+product i {}
+module m { static X: i = 1; }
+//~ error: could not find `i` in scope
+//~ error: aborting due to 1 previous error

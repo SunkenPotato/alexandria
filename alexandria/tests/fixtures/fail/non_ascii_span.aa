@@ -1,0 +1,3 @@
+static S: i = "éé"; y
+//~ error: expected an item (`func`, `product`, `sum`, `module`, `const`, `static`, `import` or `include`)
+//~ error: aborting due to 1 previous error

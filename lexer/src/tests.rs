@@ -7,11 +7,11 @@ use crate::{Lexer, Token, TokenKind};
 
 #[track_caller]
 fn assert(input: &str, expect: &[Spanned<Token>]) {
-    let mut map = SourceMap::new();
+    let map = SourceMap::new();
     let source_file = SourceFile::from_memory(input.to_owned());
     let idx = map.insert(source_file);
-    let mut diagnostics = Diagnostics::default();
-    let lexer = Lexer::new(&map, idx, &mut diagnostics);
+    let diagnostics = Diagnostics::default();
+    let lexer = Lexer::new(&map, idx, diagnostics.clone());
     match lexer.lex() {
         Ok(v) => assert_eq!(v.tokens(), expect),
         Err(_) => {
@@ -59,6 +59,9 @@ lex_atom![
     "~" = Tilde,
     "[" = LBracket,
     "]" = RBracket,
+    "{" = LCurly,
+    "}" = RCurly,
+    "%" = Percent,
     "|" = Pipe
 ];
 
@@ -93,4 +96,56 @@ fn lex_ident() {
             Token::new(TokenKind::Ident, "let"),
         )],
     )
+}
+
+#[test]
+fn lex_non_ascii_uses_byte_offsets() {
+    assert(
+        "\"é\" x",
+        &[
+            Spanned::new(Span::new(0, 4), Token::new(TokenKind::StringLit, "\"é\"")),
+            Spanned::new(Span::new(5, 6), Token::new(TokenKind::Ident, "x")),
+        ],
+    )
+}
+
+#[test]
+fn lex_non_ascii_whitespace() {
+    assert(
+        "a\u{a0}b",
+        &[
+            Spanned::new(Span::new(0, 1), Token::new(TokenKind::Ident, "a")),
+            Spanned::new(Span::new(3, 4), Token::new(TokenKind::Ident, "b")),
+        ],
+    )
+}
+
+#[test]
+fn lex_unknown_char_is_error() {
+    let map = SourceMap::new();
+    let idx = map.insert(SourceFile::from_memory("a # b".to_owned()));
+    let diagnostics = Diagnostics::default();
+    assert!(Lexer::new(&map, idx, diagnostics.clone()).lex().is_err());
+    assert_eq!(diagnostics.error_count(), 1);
+}
+
+#[test]
+fn lex_line_comment() {
+    assert("//", &[]);
+}
+
+#[test]
+fn lex_block_comment() {
+    assert("/**/", &[]);
+}
+
+#[test]
+fn lex_nested_block_comment() {
+    assert(
+        "a/* hello */b",
+        &[
+            Spanned::new(Span::new(0, 1), Token::new(TokenKind::Ident, "a")),
+            Spanned::new(Span::new(12, 13), Token::new(TokenKind::Ident, "b")),
+        ],
+    );
 }

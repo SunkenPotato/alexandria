@@ -1,0 +1,4 @@
+include a;
+include b;
+//~ error: the file of module `c` is already part of the compilation
+//~ error: aborting due to 1 previous error

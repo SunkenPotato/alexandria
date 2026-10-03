@@ -2,17 +2,14 @@
 //!
 //! This crate provides [`SourceFile`] and [`SourceMap`] as the main APIs.
 
-#![feature(seek_stream_len)]
-
 /// The source extension of an alexandria file.
 pub static SOURCE_EXTENSION: &str = "aa";
 /// Files that may be in the root of a project.
 pub static ROOT_FILES: &[&str] = &["main", "mod"];
 
 use std::{
-    collections::HashMap,
     fs::File,
-    io::{self, Seek},
+    io,
     ops::Deref,
     path::{Path, PathBuf},
     rc::Rc,
@@ -20,7 +17,9 @@ use std::{
     sync::Arc,
 };
 
-use index_vec::{IndexVec, define_index_type};
+use dashmap::DashMap;
+use index_boxcar_vec::IndexBoxcarVec;
+use index_vec::define_index_type;
 use internment::Intern;
 use memchr::Memchr;
 use memmap2::Mmap;
@@ -88,13 +87,15 @@ impl SourceFile {
     pub fn from_disk(path: impl Into<PathBuf>) -> Result<Self, SourceFileError> {
         let source: PathBuf = path.into().canonicalize()?;
 
-        let mut file = File::open(&source)?;
-        let file_len = file.stream_len()?;
+        let file = File::open(&source)?;
+        let file_len = file.metadata()?.len();
 
         if file_len > u32::MAX as u64 {
             return Err(SourceFileError::TooLarge(file_len));
         }
 
+        // SAFETY: the mapping is read-only. Modifying the file on disk while the compiler runs is
+        //         undefined behaviour; this is accepted, as with any mmap-based compiler.
         let data = unsafe { Mmap::map(&file) }?;
         // TODO: collapse the memchr and this check into one loop, if possible.
         _ = str::from_utf8(&data)?;
@@ -148,7 +149,7 @@ impl SourceFile {
         &self.newlines
     }
 
-    /// The source of this span and the context around it (line before and the line after).
+    /// The full lines covered by this span.
     pub fn context(&self, span: Span) -> Option<&str> {
         let newline_idx = match self.newlines.binary_search(&span.start()) {
             Ok(v) => v,
@@ -167,7 +168,11 @@ impl SourceFile {
 
         let stop = match &self.newlines.binary_search(&span.stop()) {
             Ok(v) => self.newlines[*v],
-            Err(e) => self.newlines.get(*e).copied().unwrap_or(span.stop()),
+            Err(e) => self
+                .newlines
+                .get(*e)
+                .copied()
+                .unwrap_or(self.contents.len() as u32),
         };
 
         let (start, stop) = (start.min(stop), start.max(stop));
@@ -254,10 +259,15 @@ define_index_type! {
 }
 
 /// A map of source files.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct SourceMap {
-    map: IndexVec<SourceIdx, SourceFile>,
-    path_index: HashMap<Arc<Path>, SourceIdx>,
+    raw: Arc<SourceMapRef>,
+}
+
+#[derive(Default, Debug)]
+struct SourceMapRef {
+    map: index_boxcar_vec::IndexBoxcarVec<SourceIdx, SourceFile>,
+    path_index: DashMap<Arc<Path>, SourceIdx>,
 }
 
 impl SourceMap {
@@ -267,29 +277,31 @@ impl SourceMap {
     }
 
     /// Insert a source file into the map. This also updates the path index.
-    pub fn insert(&mut self, file: SourceFile) -> SourceIdx {
+    pub fn insert(&self, file: SourceFile) -> SourceIdx {
         let path = file.source.clone();
-        let idx = self.map.push(file);
+        let idx = self.raw.map.push(file);
         if let Some(path) = path {
-            self.path_index.insert(path, idx);
+            self.raw.path_index.insert(path, idx);
         }
 
         idx
     }
 
     /// Load a new source file with the given name as a child of the passed node.
+    ///
+    /// The file is looked up as `{name}.aa` first and `{name}/mod.aa` second. If the file was
+    /// already loaded, it is not loaded again; see [`LoadedModule::fresh`].
     pub fn load_from_mod(
-        &mut self,
+        &self,
         node: &ModuleTree,
         name: &str,
-    ) -> Result<(SourceIdx, bool), SourceFileError> {
+    ) -> Result<LoadedModule, SourceFileError> {
         let base_path = node.dir();
-        let fname = format!("{name}.{SOURCE_EXTENSION}");
-        let (path, subdir) = if let p = base_path.join(&fname)
+        let (path, subdir) = if let p = base_path.join(format!("{name}.{SOURCE_EXTENSION}"))
             && p.exists()
         {
             (p, false)
-        } else if let p = base_path.join(format!("{fname}/mod.{SOURCE_EXTENSION}"))
+        } else if let p = base_path.join(name).join(format!("mod.{SOURCE_EXTENSION}"))
             && p.exists()
         {
             (p, true)
@@ -297,57 +309,90 @@ impl SourceMap {
             return Err(SourceFileError::NoMatches);
         };
 
+        if let Some(idx) = self.lookup(&path.canonicalize()?) {
+            return Ok(LoadedModule {
+                idx,
+                subdir,
+                fresh: false,
+            });
+        }
+
         let file = SourceFile::from_disk(path)?;
         let idx = self.insert(file);
 
-        Ok((idx, subdir))
+        Ok(LoadedModule {
+            idx,
+            subdir,
+            fresh: true,
+        })
     }
 
-    /// Lookup a path for a source file.
+    /// Lookup a path for a source file. The path must be canonical.
     pub fn lookup(&self, path: &Path) -> Option<SourceIdx> {
-        self.path_index.get(path).copied()
-    }
-
-    /// Fill the current source map with all relevant files in the given directory.
-    #[deprecated]
-    pub fn discover(&mut self, base: PathBuf) -> Result<(), SourceFileError> {
-        let base = base.canonicalize()?;
-
-        self.visit_dir(base)
-    }
-
-    fn visit_dir(&mut self, dir: PathBuf) -> Result<(), SourceFileError> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                self.visit_dir(entry.path())?;
-            } else {
-                let path = entry.path();
-                if let Some(ext) = path.extension()
-                    && ext == SOURCE_EXTENSION
-                {
-                    let file = SourceFile::from_disk(path)?;
-                    self.insert(file);
-                }
-            }
-        }
-
-        Ok(())
+        self.raw.path_index.get(path).as_deref().copied()
     }
 }
 
+/// The result of [`SourceMap::load_from_mod`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadedModule {
+    /// The index of the loaded file.
+    pub idx: SourceIdx,
+    /// Whether the module was found as `{name}/mod.aa` (`true`) or `{name}.aa` (`false`).
+    pub subdir: bool,
+    /// Whether the file was newly loaded (`true`) or had already been loaded before (`false`).
+    pub fresh: bool,
+}
+
 impl Deref for SourceMap {
-    type Target = IndexVec<SourceIdx, SourceFile>;
+    type Target = IndexBoxcarVec<SourceIdx, SourceFile>;
 
     fn deref(&self) -> &Self::Target {
-        &self.map
+        &self.raw.map
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file(s: &str) -> SourceFile {
+        SourceFile::from_memory(s.to_owned())
+    }
+
+    #[test]
+    fn context_single_line_without_trailing_newline() {
+        let f = file("func id { a }");
+        assert_eq!(f.context(Span::new(5, 7)), Some("func id { a }"));
+    }
+
+    #[test]
+    fn context_last_line_with_trailing_newline() {
+        let f = file("abc\ndef\n");
+        assert_eq!(f.context(Span::new(4, 5)), Some("def"));
+    }
+
+    #[test]
+    fn context_first_line() {
+        let f = file("abc\ndef");
+        assert_eq!(f.context(Span::new(0, 1)), Some("abc"));
+    }
+
+    #[test]
+    fn context_multi_line() {
+        let f = file("abc\ndef\nghi");
+        assert_eq!(f.context(Span::new(1, 5)), Some("abc\ndef"));
+    }
+
+    #[test]
+    fn line_col_positions() {
+        let f = file("abc\ndef");
+        assert_eq!(f.line_col(0), Some(LineCol { line: 1, column: 0 }));
+        assert_eq!(f.line_col(3), Some(LineCol { line: 1, column: 3 }));
+        assert_eq!(f.line_col(4), Some(LineCol { line: 2, column: 0 }));
+        assert_eq!(f.line_col(7), Some(LineCol { line: 2, column: 3 }));
+        assert_eq!(f.line_col(8), None);
+    }
 
     #[test]
     fn module_tree_get_dir() {

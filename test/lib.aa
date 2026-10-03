@@ -1,0 +1,3 @@
+include crate std;
+
+static FUNC: i32 = std::TEST + 5;

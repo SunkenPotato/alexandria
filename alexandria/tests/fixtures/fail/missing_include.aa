@@ -1,0 +1,3 @@
+include nope;
+//~ error: failed to find file `nope.aa` or `nope/mod.aa`
+//~ error: aborting due to 1 previous error

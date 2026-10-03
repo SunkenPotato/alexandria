@@ -1,0 +1,4 @@
+include crate nope;
+//~ error: reference to unknown crate `nope`
+//~ suggestion: pass the crate with `--crates nope=<path>`
+//~ error: aborting due to 1 previous error

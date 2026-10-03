@@ -2,21 +2,41 @@
 
 use diagnostic::Diagnostic;
 use lexer::{Intern, TokenKind};
-use node::{Node, NodeId};
-use source::{SOURCE_EXTENSION, SourceFileError};
+use node::Node;
 use span::Spanned;
 
 use crate::{
-    CONST, FUNC, IMPORT, INCLUDE, MODULE, PRODUCT, PUBLIC, Parse, ParseError, ParseGuard,
+    CONST, CRATE, FUNC, IMPORT, INCLUDE, MODULE, PRODUCT, PUBLIC, Parse, ParseError, ParseGuard,
     ParseResult, STATIC, SUM,
+    crate_table::CrateId,
     expr::{Block, Expr},
     path::Path,
 };
 
 type Generics<T> = Option<Spanned<Vec<Spanned<T>>>>;
 
-fn parse_def_generic(mut guard: ParseGuard) -> ParseResult<Intern<str>> {
-    guard.next_require(TokenKind::Ident).map(|x| x.symbol)
+/// Parse the generics of a definition (e.g., `[T, U]`), if present.
+fn parse_def_generics(guard: &mut ParseGuard) -> ParseResult<Generics<Intern<str>>> {
+    if !guard.peek_kind(TokenKind::LBracket) {
+        return Ok(None);
+    }
+
+    guard
+        .spanning(|mut g| {
+            g.parse_delimited(TokenKind::LBracket, TokenKind::RBracket, |mut g| {
+                g.expect_ident().map(|x| x.item)
+            })
+        })
+        .map(Some)
+}
+
+/// Parse a list of fields delimited by curly braces (e.g., `{ a: T, b: U }`).
+fn parse_fields(guard: &mut ParseGuard) -> ParseResult<Vec<Field>> {
+    Ok(guard
+        .parse_delimited(TokenKind::LCurly, TokenKind::RCurly, Field::parse)?
+        .into_iter()
+        .map(|x| x.item)
+        .collect())
 }
 
 /// An item.
@@ -38,46 +58,64 @@ pub enum Item {
     Module(Module),
     /// An include definition.
     Include(IncludeDef),
+    /// An include crate definition.
+    IncludeCrate(IncludeCrate),
 }
 
 impl Item {
-    pub(crate) fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
+    /// Check whether the next tokens start an item.
+    pub(crate) fn starts_item(guard: &ParseGuard) -> bool {
+        let offset = usize::from(guard.peek_kw(*PUBLIC));
+        [
+            *FUNC, *MODULE, *CONST, *STATIC, *PRODUCT, *SUM, *IMPORT, *INCLUDE,
+        ]
+        .into_iter()
+        .any(|kw| guard.peek_n_kw(offset, kw))
+    }
+
+    pub(crate) fn parse<'source, 'index>(
+        mut guard: ParseGuard<'source, 'index>,
     ) -> ParseResult<Node<Self>> {
-        guard
-            .spanning(FnDef::parse)
-            .map(|x| x.map(Self::FnDef).into())
-            .or_else(|_| {
-                guard
-                    .spanning(Module::parse)
-                    .map(|x| x.map(Self::Module).into())
-            })
-            .or_else(|_| {
-                guard
-                    .spanning(GlobalDef::parser(GlobalDefKind::Const))
-                    .map(|x| x.map(Self::ConstDef).into())
-            })
-            .or_else(|_| {
-                guard
-                    .spanning(GlobalDef::parser(GlobalDefKind::Static))
-                    .map(|x| x.map(Self::StaticDef).into())
-            })
-            .or_else(|_| {
-                guard
-                    .spanning(ProductDef::parse)
-                    .map(|x| x.map(Self::ProductDef).into())
-            })
-            .or_else(|_| {
-                guard
-                    .spanning(SumDef::parse)
-                    .map(|x| x.map(Self::SumDef).into())
-            })
-            .or_else(|_| {
-                guard
-                    .spanning(Import::parse)
-                    .map(|x| x.map(Self::Import).into())
-            })
-            .or_else(|_| guard.with(Node::parse).map(|x| x.map(Self::Include)))
+        let node: Node<Self> = guard.spanning(Self::parse_kind)?.into();
+
+        if let Self::Include(include) = &node.item {
+            guard.load_module(include.ident, node.id());
+        }
+
+        Ok(node)
+    }
+
+    /// Dispatch to the parser of the item introduced by the leading keyword.
+    fn parse_kind(mut guard: ParseGuard) -> ParseResult<Self> {
+        let offset = usize::from(guard.peek_kw(*PUBLIC));
+        let token = guard.peek_n(offset)?;
+        let is = |kw: Intern<str>| guard.peek_n_kw(offset, kw);
+
+        if is(*FUNC) {
+            guard.with(FnDef::parse).map(Self::FnDef)
+        } else if is(*MODULE) {
+            guard.with(Module::parse).map(Self::Module)
+        } else if is(*CONST) {
+            guard
+                .with(GlobalDef::parser(GlobalDefKind::Const))
+                .map(Self::ConstDef)
+        } else if is(*STATIC) {
+            guard
+                .with(GlobalDef::parser(GlobalDefKind::Static))
+                .map(Self::StaticDef)
+        } else if is(*PRODUCT) {
+            guard.with(ProductDef::parse).map(Self::ProductDef)
+        } else if is(*SUM) {
+            guard.with(SumDef::parse).map(Self::SumDef)
+        } else if is(*IMPORT) {
+            guard.with(Import::parse).map(Self::Import)
+        } else if is(*INCLUDE) && guard.peek_n_kw(offset + 1, *CRATE) {
+            guard.with(IncludeCrate::parse).map(Self::IncludeCrate)
+        } else if is(*INCLUDE) {
+            guard.with(IncludeDef::parse).map(Self::Include)
+        } else {
+            Err(ParseError::ExpectedItem(token.span))
+        }
     }
 }
 
@@ -115,13 +153,9 @@ impl GlobalDef {
 
         move |mut guard| {
             let vis = guard.spanning(Visibility::parse)?;
-            let kw = guard.next_require(TokenKind::Ident)?;
+            guard.expect_kw(def_kw)?;
 
-            if kw.item.symbol != def_kw {
-                return Err(ParseError::ExpectedKw(def_kw, kw.span));
-            }
-
-            let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+            let ident = guard.expect_ident()?;
             guard.next_require(TokenKind::Colon)?;
 
             let ty = guard.spanning(Type::parse)?;
@@ -138,18 +172,6 @@ impl GlobalDef {
                 value,
             })
         }
-    }
-}
-
-impl Parse for GlobalDef {
-    fn is_ok(&self) -> bool {
-        self.vis.item.is_ok() && self.ty.item.is_ok() && self.value.item.is_ok()
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        _guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
-        unimplemented!()
     }
 }
 
@@ -172,22 +194,12 @@ impl Import {
 }
 
 impl Parse for Import {
-    fn is_ok(&self) -> bool {
-        matches!(self, Self::Ok { .. })
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
-        let import_token = guard.next_require(TokenKind::Ident)?;
-
-        if import_token.item.symbol != *IMPORT {
-            return Err(ParseError::ExpectedKw(*IMPORT, import_token.span));
-        }
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        guard.expect_kw(*IMPORT)?;
 
         let path = guard.with(Path::parse)?;
         if let Err(e) = guard.next_require(TokenKind::Semicolon) {
-            e.display(guard.source_idx, guard.diagnostics);
+            e.display(guard.source_idx, &guard.ctx.diagnostics);
             Ok(Self::MissingSemi(path))
         } else {
             Ok(Self::Ok(path))
@@ -205,24 +217,39 @@ pub enum Visibility {
 }
 
 impl Parse for Visibility {
-    fn is_ok(&self) -> bool {
-        true
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
-        let Ok(ident) = guard.peek_require(TokenKind::Ident) else {
-            return Ok(Self::Private);
-        };
-
-        if ident.item.symbol == *PUBLIC {
-            _ = guard.next();
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        if guard.peek_kw(*PUBLIC) {
+            guard.next()?;
             Ok(Self::Public)
         } else {
             Ok(Self::Private)
         }
     }
+}
+
+/// The parts shared by product and sum definitions.
+struct TypeDef {
+    vis: Spanned<Visibility>,
+    ident: Spanned<Intern<str>>,
+    generics: Generics<Intern<str>>,
+    fields: Vec<Field>,
+}
+
+/// Parse a product or sum definition, introduced by `kw`.
+fn parse_type_def(guard: &mut ParseGuard, kw: Intern<str>) -> ParseResult<TypeDef> {
+    let vis = guard.spanning(Visibility::parse)?;
+    guard.expect_kw(kw)?;
+
+    let ident = guard.expect_ident()?;
+    let generics = parse_def_generics(guard)?;
+    let fields = parse_fields(guard)?;
+
+    Ok(TypeDef {
+        vis,
+        ident,
+        generics,
+        fields,
+    })
 }
 
 /// A product definition.
@@ -239,43 +266,13 @@ pub struct ProductDef {
 }
 
 impl Parse for ProductDef {
-    fn is_ok(&self) -> bool {
-        self.vis.item.is_ok() && self.fields.iter().all(|x| x.is_ok())
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
-        let vis = guard.spanning(Visibility::parse)?;
-        let kw = guard.next_require(TokenKind::Ident)?;
-
-        if kw.item.symbol != *PRODUCT {
-            return Err(ParseError::ExpectedKw(*PRODUCT, kw.span));
-        }
-
-        let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
-        let generics = if guard.peek_require(TokenKind::LBracket).is_ok() {
-            Some(guard.spanning(parse_generics(parse_def_generic))?)
-        } else {
-            None
-        };
-
-        guard.next_require(TokenKind::LCurly)?;
-
-        let mut fields = vec![];
-
-        while let Ok(field) = guard.with(Field::parse) {
-            fields.push(field);
-            if guard.next_require(TokenKind::Comma).is_ok() {
-                if guard.peek_require(TokenKind::RCurly).is_ok() {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        guard.next_require(TokenKind::RCurly)?;
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        let TypeDef {
+            vis,
+            ident,
+            generics,
+            fields,
+        } = parse_type_def(&mut guard, *PRODUCT)?;
 
         Ok(Self {
             vis,
@@ -296,14 +293,8 @@ pub struct Field {
 }
 
 impl Parse for Field {
-    fn is_ok(&self) -> bool {
-        self.ty.item.is_ok()
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
-        let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        let ident = guard.expect_ident()?;
         guard.next_require(TokenKind::Colon)?;
         let ty = guard.spanning(Type::parse)?;
 
@@ -325,43 +316,13 @@ pub struct SumDef {
 }
 
 impl Parse for SumDef {
-    fn is_ok(&self) -> bool {
-        self.vis.item.is_ok() && self.fields.iter().all(|x| x.is_ok())
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
-        let vis = guard.spanning(Visibility::parse)?;
-        let kw = guard.next_require(TokenKind::Ident)?;
-
-        if kw.item.symbol != *SUM {
-            return Err(ParseError::ExpectedKw(*SUM, kw.span));
-        }
-
-        let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
-        let generics = if guard.peek_require(TokenKind::LBracket).is_ok() {
-            Some(guard.spanning(parse_generics(parse_def_generic))?)
-        } else {
-            None
-        };
-
-        guard.next_require(TokenKind::LCurly)?;
-
-        let mut fields = vec![];
-
-        while let Ok(field) = guard.with(Field::parse) {
-            fields.push(field);
-            if guard.next_require(TokenKind::Comma).is_ok() {
-                if guard.peek_require(TokenKind::RCurly).is_ok() {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        guard.next_require(TokenKind::RCurly)?;
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        let TypeDef {
+            vis,
+            ident,
+            generics,
+            fields,
+        } = parse_type_def(&mut guard, *SUM)?;
 
         Ok(Self {
             vis,
@@ -382,17 +343,13 @@ pub struct Type {
 }
 
 impl Parse for Type {
-    fn is_ok(&self) -> bool {
-        self.path.item.is_ok()
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> crate::ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let path = guard.spanning(Path::parse)?;
 
-        let generics = if guard.peek_require(TokenKind::LBracket).is_ok() {
-            Some(guard.spanning(parse_generics(Self::parse))?)
+        let generics = if guard.peek_kind(TokenKind::LBracket) {
+            Some(guard.spanning(|mut g| {
+                g.parse_delimited(TokenKind::LBracket, TokenKind::RBracket, Self::parse)
+            })?)
         } else {
             None
         };
@@ -401,30 +358,6 @@ impl Parse for Type {
             path: path.into(),
             generics,
         })
-    }
-}
-
-fn parse_generics<T>(
-    subparser: impl FnMut(ParseGuard) -> ParseResult<T> + Copy,
-) -> impl FnOnce(ParseGuard) -> ParseResult<Vec<Spanned<T>>> {
-    move |mut guard| {
-        guard.next_require(TokenKind::LBracket)?;
-
-        let mut generics = vec![];
-        while let Ok(item) = guard.spanning(subparser) {
-            generics.push(item);
-            if guard.next_require(TokenKind::Comma).is_ok() {
-                if guard.peek_require(TokenKind::RBracket).is_ok() {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        guard.next_require(TokenKind::RBracket)?;
-
-        Ok(generics)
     }
 }
 
@@ -446,46 +379,13 @@ pub struct FnDef {
 }
 
 impl Parse for FnDef {
-    fn is_ok(&self) -> bool {
-        self.vis.item.is_ok()
-            && self.ret_ty.as_ref().is_none_or(|x| x.item.is_ok())
-            && self.args.iter().all(Parse::is_ok)
-            && self.block.item.is_ok()
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let vis = guard.spanning(Visibility::parse)?;
-        let func_kw = guard.next_require(TokenKind::Ident)?;
+        guard.expect_kw(*FUNC)?;
 
-        if func_kw.item.symbol != *FUNC {
-            return Err(ParseError::ExpectedKw(*FUNC, func_kw.span));
-        }
-
-        let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
-        let generics = if guard.peek_require(TokenKind::LBracket).is_ok() {
-            Some(guard.spanning(parse_generics(parse_def_generic))?)
-        } else {
-            None
-        };
-
-        guard.next_require(TokenKind::LCurly)?;
-
-        let mut args = vec![];
-
-        while let Ok(arg) = guard.with(Field::parse) {
-            args.push(arg);
-            if guard.next_require(TokenKind::Comma).is_ok() {
-                if guard.peek_require(TokenKind::RCurly).is_ok() {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        guard.next_require(TokenKind::RCurly)?;
+        let ident = guard.expect_ident()?;
+        let generics = parse_def_generics(&mut guard)?;
+        let args = parse_fields(&mut guard)?;
 
         let ret_ty = if guard.next_require(TokenKind::Colon).is_ok() {
             Some(guard.spanning(Type::parse)?)
@@ -506,25 +406,20 @@ impl Parse for FnDef {
     }
 }
 
-/// An inline module.
-#[derive(Debug, Clone, PartialEq)]
+/// An inline module, i.e., a list of items.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct InlineModule {
     /// The items contained within the module.
     pub items: Vec<Node<Item>>,
 }
 
 impl Parse for InlineModule {
-    fn is_ok(&self) -> bool {
-        true
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> crate::ParseResult<Self> {
+    /// Parse items until the end of the input or a `}`, which is not consumed.
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let mut items = vec![];
 
-        while let Ok(item) = guard.with(Item::parse) {
-            items.push(item);
+        while guard.peek().is_ok_and(|x| x.item.kind != TokenKind::RCurly) {
+            items.push(guard.with(Item::parse)?);
         }
 
         Ok(InlineModule { items })
@@ -543,47 +438,16 @@ pub struct Module {
 }
 
 impl Parse for Module {
-    fn is_ok(&self) -> bool {
-        self.vis.item.is_ok() && self.module.is_ok()
-    }
-
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: crate::ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> crate::ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let vis = guard.spanning(Visibility::parse)?;
-        let kw = guard.next_require(TokenKind::Ident)?;
-        if kw.item.symbol != *MODULE {
-            return Err(ParseError::ExpectedKw(*MODULE, kw.span));
-        }
+        guard.expect_kw(*MODULE)?;
 
-        let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+        let ident = guard.expect_ident()?;
         guard.next_require(TokenKind::LCurly)?;
-        let mut items = vec![];
-        guard.commit_diag();
+        let module = guard.with(InlineModule::parse)?;
+        guard.next_require(TokenKind::RCurly)?;
 
-        loop {
-            let res = guard.with(Item::parse);
-
-            match res {
-                Ok(res) => items.push(res),
-                Err(e) => {
-                    if guard.next_require(TokenKind::RCurly).is_ok() {
-                        guard.rollback_diag();
-                        break;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-
-            guard.commit_diag();
-        }
-
-        Ok(Self {
-            vis,
-            ident,
-            module: InlineModule { items },
-        })
+        Ok(Self { vis, ident, module })
     }
 }
 
@@ -594,88 +458,63 @@ pub struct IncludeDef {
     pub vis: Spanned<Visibility>,
     /// The identifier.
     pub ident: Spanned<Intern<str>>,
-    /// Whether the parser was able to associate a semicolon with this.
+    /// Whether the parser was unable to find a semicolon after this.
     pub missing_semi: bool,
 }
 
-impl Parse for Node<IncludeDef> {
-    fn is_ok(&self) -> bool {
-        self.missing_semi
-    }
+impl Parse for IncludeDef {
+    /// Parse the definition. This does not load the module; see [`Item::parse`].
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        let vis = guard.spanning(Visibility::parse)?;
+        guard.expect_kw(*INCLUDE)?;
 
-    fn parse<'diag, 'source, 'index, 'a>(
-        mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self> {
-        let parsed: Node<_> = guard
-            .spanning(|mut guard| {
-                let vis = guard.spanning(Visibility::parse)?;
-                let kw = guard.next_require(TokenKind::Ident)?;
-                if kw.symbol != *INCLUDE {
-                    return Err(ParseError::ExpectedKw(*INCLUDE, kw.span));
-                }
+        let ident = guard.expect_ident()?;
+        let semi = guard.next_require(TokenKind::Semicolon);
 
-                let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+        if let Err(e) = &semi {
+            e.display(guard.source_idx, &guard.ctx.diagnostics);
+        }
 
-                let semi = guard.next_require(TokenKind::Semicolon);
-
-                if let Err(e) = &semi {
-                    e.display(guard.source_idx, guard.diagnostics);
-                }
-
-                Ok(IncludeDef {
-                    vis,
-                    ident,
-                    missing_semi: semi.is_err(),
-                })
-            })?
-            .into();
-
-        #[cfg(not(test))]
-        IncludeDef::parse_file(guard, parsed.ident, parsed.id());
-
-        Ok(parsed)
+        Ok(IncludeDef {
+            vis,
+            ident,
+            missing_semi: semi.is_err(),
+        })
     }
 }
 
-impl IncludeDef {
-    #[allow(unused)]
-    fn parse_file(mut guard: ParseGuard, ident: Spanned<Intern<str>>, node_id: NodeId) {
-        let (file_id, is_nested) =
-            match guard.sources.load_from_mod(&guard.module_tree, &ident.item) {
-                Ok(r) => r,
-                Err(SourceFileError::Io(_) | SourceFileError::TooLarge(_)) => {
-                    return guard.diagnostics.push(Diagnostic::error(
-                        ident.span,
-                        format!("failed to read source for module `{}`", ident.item),
-                        None,
-                        guard.source_idx,
-                    ));
-                }
-                Err(SourceFileError::Utf8(_)) => {
-                    return guard.diagnostics.push(Diagnostic::error(
-                        ident.span,
-                        format!("the module `{}` does not contain valid UTF-8", ident.item),
-                        None,
-                        guard.source_idx,
-                    ));
-                }
-                Err(SourceFileError::NoMatches) => {
-                    return guard.diagnostics.push(Diagnostic::error(
-                        ident.span,
-                        format!(
-                            "failed to find file `{name}.{ext}` or `{name}/mod.{ext}`",
-                            name = ident.item,
-                            ext = SOURCE_EXTENSION,
-                        ),
-                        None,
-                        guard.source_idx,
-                    ));
-                }
-            };
+/// A statement to include a crate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncludeCrate {
+    /// The name of this crate
+    pub ident: Spanned<Intern<str>>,
+    /// The ID of the crate, if a crate with this name exists.
+    pub crate_id: Option<CrateId>,
+}
 
-        if let Err(e) = guard.parse_module(file_id, node_id, ident.item, is_nested) {
-            e.display(guard.source_idx, guard.diagnostics);
+impl Parse for IncludeCrate {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        guard.expect_kw(*INCLUDE)?;
+        guard.expect_kw(*CRATE)?;
+
+        let ident = guard.expect_ident()?;
+        guard.next_require(TokenKind::Semicolon)?;
+
+        let crate_id = guard.ctx.crate_table.id_by_name(ident.item);
+        match crate_id {
+            Some(id) => guard.ctx.crate_table.request(id),
+            None => guard.emit(Diagnostic::error(
+                ident.span,
+                format!("reference to unknown crate `{}`", ident.item),
+                Some(format!(
+                    "pass the crate with `--crates {}=<path>`",
+                    ident.item
+                )),
+                guard.source_idx,
+            )),
         }
+
+        Ok(Self { ident, crate_id })
     }
 }
 

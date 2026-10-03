@@ -1,5 +1,4 @@
 //! The parser for alexandria. See [`Parser`] for the entrypoint.
-#![feature(str_from_raw_parts)]
 
 pub mod expr;
 pub mod item;
@@ -7,16 +6,18 @@ pub mod stmt;
 
 use std::rc::Rc;
 
-use dashmap::DashMap;
-use derive_more::From;
 use diagnostic::{Diagnostic, Diagnostics};
 use lexer::{Intern, LexError, Lexer, Token, TokenKind};
 use node::NodeId;
 use smallvec::SmallVec;
-use source::{ModuleTree, SourceIdx, SourceMap};
+use source::{LoadedModule, ModuleTree, SOURCE_EXTENSION, SourceFileError, SourceIdx, SourceMap};
 use span::{Span, Spanned};
 
-use crate::item::{InlineModule, Item};
+use crate::{
+    ast_table::AstTable,
+    crate_table::{CrateId, CrateTable},
+    item::InlineModule,
+};
 
 /// A specialized `Result<T, ParseError>`
 pub type ParseResult<T> = std::result::Result<T, ParseError>;
@@ -59,54 +60,207 @@ keywords! {
     CRATE = "crate"
 }
 
-/// A collection of AST, grouped by file.
-#[derive(Debug, Default)]
-pub struct AstTable {
-    /// The source-AST relation.
-    source_map: DashMap<SourceIdx, InlineModule>,
-    /// The node-source relation.
-    node_map: DashMap<NodeId, SourceIdx>,
+/// Check whether the given symbol is a keyword.
+pub fn is_keyword(symbol: Intern<str>) -> bool {
+    KEYWORDS.iter().any(|kw| ***kw == symbol)
 }
 
-impl AstTable {
-    /// Retrieve the AST of a given file.
-    ///
-    /// # Panics
-    /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
-    pub fn by_src(&self, k: SourceIdx) -> dashmap::mapref::one::Ref<'_, SourceIdx, InlineModule> {
-        self.source_map.get(&k).unwrap()
+/// Implementation of the [`AstTable`].
+pub mod ast_table {
+    use std::sync::Arc;
+
+    use dashmap::DashMap;
+    use node::NodeId;
+    use source::SourceIdx;
+
+    use crate::item::InlineModule;
+
+    /// A collection of AST, grouped by file.
+    #[derive(Clone, Debug, Default)]
+    pub struct AstTable {
+        raw: Arc<AstTableRef>,
     }
 
-    /// Retrieve the AST of a given node.
-    ///
-    /// # Panics
-    /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
-    pub fn by_node_id(&self, k: NodeId) -> dashmap::mapref::one::Ref<'_, SourceIdx, InlineModule> {
-        self.by_src(self.source_idx(k))
+    #[derive(Debug, Default)]
+    struct AstTableRef {
+        /// The source-AST relation.
+        source_map: DashMap<SourceIdx, InlineModule>,
+        /// The node-source relation.
+        node_map: DashMap<NodeId, SourceIdx>,
     }
 
-    /// Retrieve the source ID of a node.
-    ///
-    /// # Panics
-    /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
-    pub fn source_idx(&self, k: NodeId) -> SourceIdx {
-        *self.node_map.get(&k).unwrap()
+    impl AstTable {
+        /// Retrieve the AST of a given file.
+        ///
+        /// # Panics
+        /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
+        pub fn by_src(
+            &self,
+            k: SourceIdx,
+        ) -> dashmap::mapref::one::Ref<'_, SourceIdx, InlineModule> {
+            self.raw.source_map.get(&k).unwrap()
+        }
+
+        /// Retrieve the AST of a given node.
+        ///
+        /// # Panics
+        /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
+        pub fn by_node_id(
+            &self,
+            k: NodeId,
+        ) -> dashmap::mapref::one::Ref<'_, SourceIdx, InlineModule> {
+            self.by_src(self.source_idx(k))
+        }
+
+        /// Retrieve the source ID of a node.
+        ///
+        /// # Panics
+        /// This immediately calls unwrap, so if the table does not contain `k`, this will panic.
+        pub fn source_idx(&self, k: NodeId) -> SourceIdx {
+            *self.raw.node_map.get(&k).unwrap()
+        }
+
+        /// Add an AST to the table.
+        pub fn insert(&self, source: SourceIdx, node: NodeId, data: InlineModule) {
+            self.raw.source_map.insert(source, data);
+            self.raw.node_map.insert(node, source);
+        }
+
+        /// Check whether the AST of the given file is in the table.
+        pub fn contains(&self, source: SourceIdx) -> bool {
+            self.raw.source_map.contains_key(&source)
+        }
+
+        /// Check whether the table is empty.
+        pub fn is_empty(&self) -> bool {
+            self.raw.source_map.is_empty()
+        }
+    }
+}
+
+/// Implementation of the [`CrateTable`].
+///
+/// Crates are parsed sequentially: every crate is registered up front, `include crate` requests
+/// a crate, and the driver parses requested crates until none are left
+/// (see [`CrateTable::next_requested`]).
+pub mod crate_table {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, MutexGuard},
+    };
+
+    use index_vec::IndexVec;
+    use lexer::Intern;
+    use source::SourceIdx;
+
+    index_vec::define_index_type! {
+        /// A unique identifier for a crate.
+        pub struct CrateId = u32;
     }
 
-    /// Add an AST to the table.
-    pub fn insert(&self, source: SourceIdx, node: NodeId, data: InlineModule) {
-        self.source_map.insert(source, data);
-        self.node_map.insert(node, source);
+    /// The parse state of a crate.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CrateState {
+        /// The crate is known, but nothing has requested it yet.
+        Registered,
+        /// The crate has been requested, but not parsed yet.
+        Requested,
+        /// The crate is being parsed.
+        Parsing,
+        /// The crate was parsed successfully.
+        Parsed,
+        /// Parsing the crate failed.
+        Failed,
     }
 
-    /// Check whether the table is empty.
-    pub fn is_empty(&self) -> bool {
-        self.source_map.is_empty()
+    /// Information about a crate.
+    #[derive(Clone, Debug)]
+    pub struct CrateEntry {
+        /// The name of the crate.
+        pub name: Intern<str>,
+        /// The entrypoint file of the crate.
+        pub root: SourceIdx,
+        /// The parse state of the crate.
+        pub state: CrateState,
+    }
+
+    /// A registry for crates.
+    #[derive(Clone, Debug, Default)]
+    pub struct CrateTable {
+        raw: Arc<Mutex<CrateTableRaw>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct CrateTableRaw {
+        crates: IndexVec<CrateId, CrateEntry>,
+        names: HashMap<Intern<str>, CrateId>,
+    }
+
+    impl CrateTable {
+        fn lock(&self) -> MutexGuard<'_, CrateTableRaw> {
+            self.raw.lock().unwrap_or_else(|poison| poison.into_inner())
+        }
+
+        /// Register a crate. Returns [`None`] if a crate with the same name already exists.
+        pub fn insert(&self, name: Intern<str>, root: SourceIdx) -> Option<CrateId> {
+            let mut raw = self.lock();
+
+            if raw.names.contains_key(&name) {
+                return None;
+            }
+
+            let id = raw.crates.push(CrateEntry {
+                name,
+                root,
+                state: CrateState::Registered,
+            });
+            raw.names.insert(name, id);
+            Some(id)
+        }
+
+        /// Retrieve the ID of a crate by its name.
+        pub fn id_by_name(&self, name: Intern<str>) -> Option<CrateId> {
+            self.lock().names.get(&name).copied()
+        }
+
+        /// Retrieve information about a crate.
+        pub fn get(&self, id: CrateId) -> CrateEntry {
+            self.lock().crates[id].clone()
+        }
+
+        /// Request a crate to be parsed. This does nothing if the crate was already requested.
+        pub fn request(&self, id: CrateId) {
+            let entry = &mut self.lock().crates[id];
+            if entry.state == CrateState::Registered {
+                entry.state = CrateState::Requested;
+            }
+        }
+
+        /// Take the next requested crate and mark it as being parsed.
+        pub fn next_requested(&self) -> Option<CrateId> {
+            let mut raw = self.lock();
+            let (id, entry) = raw
+                .crates
+                .iter_mut_enumerated()
+                .find(|(_, x)| x.state == CrateState::Requested)?;
+
+            entry.state = CrateState::Parsing;
+            Some(id)
+        }
+
+        /// Mark a crate as finished.
+        pub fn finish(&self, id: CrateId, success: bool) {
+            self.lock().crates[id].state = if success {
+                CrateState::Parsed
+            } else {
+                CrateState::Failed
+            };
+        }
     }
 }
 
 /// A parser error. Most errors are expressed via diagnostics instead of this
-#[derive(From, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum ParseError {
     /// Expected one of the given tokens at the specified location.
     TokenMismatch(SmallVec<[TokenKind; 6]>, Span),
@@ -114,283 +268,227 @@ pub enum ParseError {
     Eof(SmallVec<[TokenKind; 3]>, Span),
     /// Expected the keyword at that location.
     ExpectedKw(Intern<str>, Span),
-    #[doc(hidden)]
-    InternalParseError,
+    /// A keyword was used where an identifier was expected.
+    KwAsIdent(Intern<str>, Span),
+    /// Expected an item at that location.
+    ExpectedItem(Span),
     /// An error was produced by the lexer/tokenizer.
     LexError(LexError),
     /// The entire input was not consumed fully.
     ///
-    /// The span points to the last token in the source.
+    /// The span points to the first token that was not consumed.
     InputNotConsumed(Span),
+}
+
+impl From<LexError> for ParseError {
+    fn from(value: LexError) -> Self {
+        Self::LexError(value)
+    }
 }
 
 impl ParseError {
     /// Convert this error into a diagnostic and add it to the given pool.
-    #[track_caller]
-    pub fn display(&self, source: SourceIdx, diag: &mut Diagnostics) {
-        match self {
-            ParseError::ExpectedKw(kw, span) => {
-                diag.push(Diagnostic::error(
-                    *span,
-                    format!("expected keyword '{kw}'"),
-                    None,
-                    source,
-                ));
+    pub fn display(&self, source: SourceIdx, diag: &Diagnostics) {
+        let (span, msg) = match self {
+            Self::ExpectedKw(kw, span) => (span, format!("expected keyword `{kw}`")),
+            Self::KwAsIdent(kw, span) => (
+                span,
+                format!("expected an identifier, found keyword `{kw}`"),
+            ),
+            Self::ExpectedItem(span) => (
+                span,
+                "expected an item (`func`, `product`, `sum`, `module`, `const`, `static`, \
+                 `import` or `include`)"
+                    .to_owned(),
+            ),
+            Self::TokenMismatch(tokens, span) => (span, format!("expected {}", describe(tokens))),
+            Self::Eof(tokens, span) if tokens.is_empty() => {
+                (span, "unexpected end of file".to_owned())
             }
-            ParseError::TokenMismatch(tokens, span) => {
-                let msg = if tokens.len() > 1 {
-                    format!("expected one of {tokens:?}")
-                } else {
-                    format!("expected {:?}", tokens[0])
-                };
+            Self::Eof(tokens, span) => (
+                span,
+                format!("expected {}, found end of file", describe(tokens)),
+            ),
+            Self::InputNotConsumed(span) => (span, "unexpected token".to_owned()),
+            // the lexer already pushes diagnostics
+            Self::LexError(_) => return,
+        };
 
-                diag.push(Diagnostic::error(*span, msg, None, source));
-            }
-            ParseError::Eof(tokens, span) => {
-                let msg = if tokens.len() > 1 {
-                    format!("expected one of {tokens:?}, got EOF")
-                } else if tokens.is_empty() {
-                    "unexpected EOF".to_owned()
-                } else {
-                    format!("expected {:?}", tokens[0])
-                };
+        diag.push(Diagnostic::error(*span, msg, None, source));
+    }
+}
 
-                diag.push(Diagnostic::error(*span, msg, None, source));
-            }
-            ParseError::InputNotConsumed(span) => diag.push(Diagnostic::error(
-                *span,
-                "failed to consume input fully",
-                None,
-                source,
-            )),
-            // lexer already pushes diagnostics
-            ParseError::LexError(_) => (),
-            ParseError::InternalParseError => unimplemented!(),
+fn describe(tokens: &[TokenKind]) -> String {
+    match tokens {
+        [] => "a token".to_owned(),
+        [one] => one.to_string(),
+        [init @ .., last] => {
+            let init: Vec<_> = init.iter().map(ToString::to_string).collect();
+            format!("one of {} or {last}", init.join(", "))
         }
+    }
+}
+
+/// State shared by every parser of a compilation.
+#[derive(Clone, Debug)]
+struct ParseContext {
+    diagnostics: Diagnostics,
+    sources: SourceMap,
+    ast_table: AstTable,
+    crate_table: CrateTable,
+}
+
+impl ParseContext {
+    /// Lex and parse an entire file.
+    fn parse_source(
+        &self,
+        source_idx: SourceIdx,
+        module_tree: Option<Rc<ModuleTree>>,
+    ) -> ParseResult<InlineModule> {
+        let lexed = Lexer::new(&self.sources, source_idx, self.diagnostics.clone()).lex()?;
+        let mut index = 0;
+        let mut guard = ParseGuard {
+            ctx: self.clone(),
+            index: &mut index,
+            stream: lexed.tokens(),
+            source_idx,
+            module_tree,
+        };
+
+        let module = guard.with(InlineModule::parse)?;
+
+        if let Ok(token) = guard.peek() {
+            return Err(ParseError::InputNotConsumed(token.span));
+        }
+
+        Ok(module)
     }
 }
 
 /// The parser. See [`Parser::parse`].
-pub struct Parser<'s, 'd, 'a> {
+pub struct Parser {
+    crate_id: CrateId,
     entrypoint: SourceIdx,
-    sources: &'s mut SourceMap,
-    diagnostics: &'d mut Diagnostics,
-    ast_table: &'a AstTable,
+    ctx: ParseContext,
 }
 
-impl<'s, 'd, 'a> Parser<'s, 'd, 'a> {
-    /// Create a new parser to parse the given source file as the entrypoint.
+impl Parser {
+    /// Create a new parser to parse the given crate.
     pub fn new(
-        sources: &'s mut SourceMap,
-        entrypoint: SourceIdx,
-        diagnostics: &'d mut Diagnostics,
-        ast_table: &'a AstTable,
+        sources: SourceMap,
+        crate_id: CrateId,
+        diagnostics: Diagnostics,
+        ast_table: AstTable,
+        crate_table: CrateTable,
     ) -> Self {
+        let entrypoint = crate_table.get(crate_id).root;
+
         Self {
-            sources,
+            crate_id,
             entrypoint,
-            diagnostics,
-            ast_table,
+            ctx: ParseContext {
+                diagnostics,
+                sources,
+                ast_table,
+                crate_table,
+            },
         }
     }
 
-    /// Parse the specified input. This mutates the AST table instead of returning the result.
-    pub fn parse(self) -> ParseResult<()> {
-        let lexed = Lexer::new(self.sources, self.entrypoint, self.diagnostics).lex()?;
-        let mut guard = ParseGuard {
-            diagnostics: self.diagnostics,
-            index: &mut 0,
-            committed: 0,
-            diag_len: 0,
-            stream: lexed.tokens(),
-            source_idx: self.entrypoint,
-            ast_table: self.ast_table,
-            module_tree: ModuleTree::new(
-                self.sources[self.entrypoint].source().unwrap().to_owned(),
-            ),
-            sources: self.sources,
+    /// Parse the crate. This inserts the result into the AST table, reports errors as
+    /// diagnostics and marks the crate as finished in the crate table.
+    ///
+    /// Returns whether parsing succeeded.
+    pub fn parse(self) -> bool {
+        let module_tree = self.ctx.sources[self.entrypoint]
+            .source()
+            .and_then(std::path::Path::parent)
+            .map(|dir| ModuleTree::new(dir.to_owned()));
+
+        let success = match self.ctx.parse_source(self.entrypoint, module_tree) {
+            Ok(module) => {
+                self.ctx
+                    .ast_table
+                    .insert(self.entrypoint, NodeId::new(), module);
+                true
+            }
+            Err(e) => {
+                e.display(self.entrypoint, &self.ctx.diagnostics);
+                false
+            }
         };
 
-        guard.commit_diag();
-
-        let parse_res = guard.with(|mut guard| {
-            let mut items = vec![];
-
-            loop {
-                match guard.with(Item::parse) {
-                    Ok(r) => items.push(r),
-                    Err(e) => return Err(e),
-                }
-
-                guard.commit_diag();
-
-                if let Err(ParseError::Eof(..)) = guard.peek() {
-                    guard.rollback_diag();
-
-                    break;
-                }
-            }
-
-            Ok(InlineModule { items })
-        });
-        let consumed_tokens = *guard.index;
-
-        if consumed_tokens != lexed.tokens().len() {
-            return Err(parse_res.err().unwrap_or(ParseError::InputNotConsumed(
-                guard
-                    .peek()
-                    .map(|x| x.span)
-                    .ok()
-                    .or_else(|| guard.stream.last().map(|x| x.span))
-                    .unwrap_or(Span::new(0, 0)),
-            )));
-        }
-
-        drop(guard);
-
-        self.ast_table
-            .insert(self.entrypoint, NodeId::new(), parse_res?);
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn guard<'gd, 'gs, 'this>(
-        &'this mut self,
-        stream: &'s [Spanned<Token>],
-    ) -> ParseGuard<'gd, 'gs, 'static, 'a>
-    where
-        'this: 'gd + 'gs,
-        's: 'gs,
-    {
-        use std::path::PathBuf;
-
-        ParseGuard::<'gd, 'gs, 'static, 'a> {
-            diag_len: self.diagnostics.len(),
-            diagnostics: self.diagnostics,
-            // ONLY because this is #[cfg(test)]
-            index: Box::leak(Box::new(0)),
-            committed: 0,
-            source_idx: self.entrypoint,
-            sources: self.sources,
-            ast_table: self.ast_table,
-            module_tree: ModuleTree::new(PathBuf::new()),
-            stream,
-        }
+        self.ctx.crate_table.finish(self.crate_id, success);
+        success
     }
 }
 
 /// A parser guard for parsing a specific element.
 #[derive(Debug)]
-pub struct ParseGuard<'d, 's, 'i, 'a> {
-    diagnostics: &'d mut Diagnostics,
+pub struct ParseGuard<'s, 'i> {
+    ctx: ParseContext,
     index: &'i mut usize,
-    committed: usize,
-    diag_len: usize,
     stream: &'s [Spanned<Token>],
     source_idx: SourceIdx,
-    sources: &'s mut SourceMap,
-    ast_table: &'a AstTable,
-    module_tree: Rc<ModuleTree>,
+    /// The module tree of the current file. This is [`None`] for in-memory sources.
+    module_tree: Option<Rc<ModuleTree>>,
 }
 
-impl<'d, 's, 'i, 'a> ParseGuard<'d, 's, 'i, 'a> {
-    fn subguard<'d2, 's2, 'i2, 'this>(
-        &'this mut self,
-        index: &'i2 mut usize,
-        stream: Option<&'s2 [Spanned<Token>]>,
-        source: Option<SourceIdx>,
-    ) -> ParseGuard<'d2, 's2, 'i2, 'a>
-    where
-        'd: 'd2,
-        's: 's2,
-        'i: 'i2,
-        'this: 'd2 + 'i2 + 's2,
-    {
+impl<'s> ParseGuard<'s, '_> {
+    fn subguard<'i2>(&self, index: &'i2 mut usize) -> ParseGuard<'s, 'i2> {
         ParseGuard {
-            diag_len: self.diagnostics.len(),
-            diagnostics: &mut *self.diagnostics,
-            committed: *self.index,
-            stream: stream.unwrap_or(self.stream),
-            source_idx: source.unwrap_or(self.source_idx),
-            sources: self.sources,
-            ast_table: self.ast_table,
-            module_tree: Rc::clone(&self.module_tree),
+            ctx: self.ctx.clone(),
             index,
+            stream: self.stream,
+            source_idx: self.source_idx,
+            module_tree: self.module_tree.clone(),
         }
     }
 
-    /// Commit the diagnostics to the current status.s
-    pub fn commit_diag(&mut self) {
-        self.diag_len = self.diagnostics.len();
+    /// Emit a diagnostic in the current file.
+    fn emit(&self, diagnostic: Diagnostic) {
+        self.ctx.diagnostics.push(diagnostic);
     }
 
-    /// Rollback all diagnostics added since the last commit.
-    pub fn rollback_diag(&mut self) {
-        self.diagnostics.cull(self.diag_len);
+    /// The span used for errors at the end of the input.
+    fn eof_span(&self) -> Span {
+        self.stream
+            .get(self.index.saturating_sub(1))
+            .or(self.stream.last())
+            .map(|x| Span::new(x.span.stop(), x.span.stop()))
+            .unwrap_or(Span::new(0, 0))
     }
 
-    /// Manually commit the consumed tokens.
-    pub fn commit(&mut self) {
-        self.committed = *self.index;
-    }
-
-    /// Rollback the consumed tokens.
-    pub fn rollback(&mut self) {
-        *self.index = self.committed;
+    fn eof(&self, expected: SmallVec<[TokenKind; 3]>) -> ParseError {
+        ParseError::Eof(expected, self.eof_span())
     }
 
     /// Consume a token.
     #[expect(clippy::should_implement_trait)]
     pub fn next(&mut self) -> ParseResult<Spanned<Token>> {
-        match self.stream.get(*self.index) {
-            Some(v) => {
-                *self.index += 1;
-                Ok(*v)
-            }
-            None => {
-                let span = self
-                    .stream
-                    .get(self.index.saturating_sub(1))
-                    .map(|x| x.span)
-                    .unwrap_or(Span::new(0, 0));
-
-                Err(ParseError::Eof(smallvec::smallvec![], span))
-            }
-        }
+        let token = self.peek()?;
+        *self.index += 1;
+        Ok(token)
     }
 
     /// Get the next token without consuming it.
     pub fn peek(&self) -> ParseResult<Spanned<Token>> {
-        self.stream.get(*self.index).copied().ok_or_else(|| {
-            let span = self
-                .stream
-                .get(self.index.saturating_sub(1))
-                .map(|x| x.span)
-                .unwrap_or(Span::new(0, 0));
+        self.peek_n(0)
+    }
 
-            ParseError::Eof(smallvec::smallvec![], span)
-        })
+    /// Get the nth token without consuming it.
+    pub fn peek_n(&self, n: usize) -> ParseResult<Spanned<Token>> {
+        self.stream
+            .get(*self.index + n)
+            .copied()
+            .ok_or_else(|| self.eof(SmallVec::new()))
     }
 
     /// Consume the next token if it is of the given kind.
     pub fn next_require(&mut self, kind: TokenKind) -> ParseResult<Spanned<Token>> {
-        match self.stream.get(*self.index) {
-            Some(v) if v.item.kind == kind => {
-                *self.index += 1;
-                Ok(*v)
-            }
-            Some(v) => Err(ParseError::TokenMismatch(smallvec::smallvec![kind], v.span)),
-            None => {
-                let span = self
-                    .stream
-                    .get(self.index.saturating_sub(1))
-                    .map(|x| x.span)
-                    .unwrap_or(Span::new(0, 0));
-
-                Err(ParseError::Eof(smallvec::smallvec![kind], span))
-            }
-        }
+        let token = self.peek_require(kind)?;
+        *self.index += 1;
+        Ok(token)
     }
 
     /// See [`Self::peek`] and [`Self::next_require`].
@@ -398,58 +496,131 @@ impl<'d, 's, 'i, 'a> ParseGuard<'d, 's, 'i, 'a> {
         match self.stream.get(*self.index) {
             Some(v) if v.item.kind == kind => Ok(*v),
             Some(v) => Err(ParseError::TokenMismatch(smallvec::smallvec![kind], v.span)),
-            None => {
-                let span = self
-                    .stream
-                    .get(self.index.saturating_sub(1))
-                    .map(|x| x.span)
-                    .unwrap_or(Span::new(0, 0));
-
-                Err(ParseError::Eof(smallvec::smallvec![kind], span))
-            }
+            None => Err(self.eof(smallvec::smallvec![kind])),
         }
     }
 
-    /// Get the nth token without consuming it.
-    pub fn peek_n(&self, n: usize) -> ParseResult<Spanned<Token>> {
-        match self.stream.get(*self.index + n) {
-            Some(v) => Ok(*v),
-            None => {
-                let span = self
-                    .stream
-                    .get(self.index.saturating_sub(1))
-                    .map(|x| x.span)
-                    .unwrap_or(Span::new(0, 0));
+    /// Check whether the next token is of the given kind.
+    pub fn peek_kind(&self, kind: TokenKind) -> bool {
+        self.peek_require(kind).is_ok()
+    }
 
-                Err(ParseError::Eof(smallvec::smallvec![], span))
+    /// Check whether the nth token is the given keyword.
+    pub fn peek_n_kw(&self, n: usize, kw: Intern<str>) -> bool {
+        self.peek_n(n)
+            .is_ok_and(|x| x.item.kind == TokenKind::Ident && x.item.symbol == kw)
+    }
+
+    /// Check whether the next token is the given keyword.
+    pub fn peek_kw(&self, kw: Intern<str>) -> bool {
+        self.peek_n_kw(0, kw)
+    }
+
+    /// Consume the given keyword.
+    pub fn expect_kw(&mut self, kw: Intern<str>) -> ParseResult<Span> {
+        match self.peek() {
+            Ok(token) if token.item.kind == TokenKind::Ident && token.item.symbol == kw => {
+                *self.index += 1;
+                Ok(token.span)
+            }
+            Ok(token) => Err(ParseError::ExpectedKw(kw, token.span)),
+            Err(_) => Err(self.eof(smallvec::smallvec![TokenKind::Ident])),
+        }
+    }
+
+    /// Consume an identifier that is not a keyword.
+    pub fn expect_ident(&mut self) -> ParseResult<Spanned<Intern<str>>> {
+        let token = self.peek_require(TokenKind::Ident)?;
+        if is_keyword(token.item.symbol) {
+            return Err(ParseError::KwAsIdent(token.item.symbol, token.span));
+        }
+
+        *self.index += 1;
+        Ok(token.map(|x| x.symbol))
+    }
+
+    /// Consume the next token if it is of the given kind and directly follows `prev` (i.e.,
+    /// without any whitespace in between). Used for multi-character operators.
+    pub fn next_adjacent(&mut self, prev: Span, kind: TokenKind) -> Option<Spanned<Token>> {
+        let token = self.peek_require(kind).ok()?;
+        if token.span.start() != prev.stop() {
+            return None;
+        }
+
+        *self.index += 1;
+        Some(token)
+    }
+
+    /// Parse a list of `item`s separated by commas and delimited by `open` and `close`.
+    /// A trailing comma is allowed.
+    pub fn parse_delimited<T, F>(
+        &mut self,
+        open: TokenKind,
+        close: TokenKind,
+        mut item: F,
+    ) -> ParseResult<Vec<Spanned<T>>>
+    where
+        F: for<'i2> FnMut(ParseGuard<'s, 'i2>) -> ParseResult<T>,
+    {
+        self.next_require(open)?;
+        let mut items = vec![];
+
+        loop {
+            if self.next_require(close).is_ok() {
+                break;
+            }
+
+            items.push(self.spanning(&mut item)?);
+
+            match self.peek() {
+                Ok(t) if t.item.kind == TokenKind::Comma => *self.index += 1,
+                Ok(t) if t.item.kind == close => {
+                    *self.index += 1;
+                    break;
+                }
+                Ok(t) => {
+                    return Err(ParseError::TokenMismatch(
+                        smallvec::smallvec![TokenKind::Comma, close],
+                        t.span,
+                    ));
+                }
+                Err(_) => return Err(self.eof(smallvec::smallvec![TokenKind::Comma, close])),
             }
         }
+
+        Ok(items)
     }
 
     /// Execute the given parser and add a span to it.
     ///
-    /// This function does not commit the result if `f` returns an error.
+    /// If `f` returns an error, neither the consumed tokens nor the diagnostics it emitted are
+    /// kept.
     pub fn spanning<F, T, E>(&mut self, f: F) -> Result<Spanned<T>, E>
     where
-        for<'d2, 's2, 'i2> F: FnOnce(ParseGuard<'d2, 's2, 'i2, 'a>) -> Result<T, E>,
+        F: for<'i2> FnOnce(ParseGuard<'s, 'i2>) -> Result<T, E>,
     {
-        let mut index = *self.index;
-        let guard = self.subguard(&mut index, None, None);
+        let start = *self.index;
+        let mut index = start;
+        let diag_len = self.ctx.diagnostics.len();
 
-        let result = f(guard)?;
+        let result = match f(self.subguard(&mut index)) {
+            Ok(v) => v,
+            Err(e) => {
+                self.ctx.diagnostics.cull(diag_len);
+                return Err(e);
+            }
+        };
 
-        let span = if *self.index == index {
-            let next_token_span = self
+        let span = if index == start {
+            let pos = self
                 .stream
-                .get(index)
-                .map(|x| x.span)
-                .unwrap_or(Span::new(0, 0));
+                .get(start)
+                .map(|x| x.span.start())
+                .unwrap_or(self.eof_span().stop());
 
-            Span::new(next_token_span.start(), next_token_span.start())
+            Span::new(pos, pos)
         } else {
-            self.stream[*self.index..index]
-                .iter()
-                .fold(self.stream[*self.index].span, |pre, t| pre.extend(t.span))
+            self.stream[start].span.extend(self.stream[index - 1].span)
         };
         *self.index = index;
 
@@ -457,59 +628,70 @@ impl<'d, 's, 'i, 'a> ParseGuard<'d, 's, 'i, 'a> {
     }
 
     /// Execute a parser and commit the result if it exits successfully.
+    ///
+    /// If `f` returns an error, neither the consumed tokens nor the diagnostics it emitted are
+    /// kept.
     pub fn with<F, T, E>(&mut self, f: F) -> Result<T, E>
     where
-        for<'d2, 's2, 'i2> F: FnOnce(ParseGuard<'d2, 's2, 'i2, 'a>) -> Result<T, E>,
+        F: for<'i2> FnOnce(ParseGuard<'s, 'i2>) -> Result<T, E>,
     {
-        let mut index = *self.index;
-        let guard = self.subguard(&mut index, None, None);
-
-        let result = f(guard)?;
-
-        *self.index = index;
-        Ok(result)
+        self.spanning(f).map(|x| x.item)
     }
 
-    /// Parse a module from its source.
+    /// Load and parse the file of the module `ident` (declared by `include ident;`).
     ///
-    /// Arguments:
-    /// + `source`: the source of the module
-    /// + `node`: the node ID of the module
-    /// + `name`: the name of the module
-    /// + `subdir`: whether the module is defined as `{module}/mod.rs` or `{module}.rs`
-    pub fn parse_module(
-        &mut self,
-        source: SourceIdx,
-        node: NodeId,
-        name: Intern<str>,
-        subdir: bool,
-    ) -> ParseResult<()> {
-        let mut index = *self.index;
-        let lexed = Lexer::new(self.sources, source, self.diagnostics).lex()?;
+    /// Errors are reported as diagnostics.
+    fn load_module(&self, ident: Spanned<Intern<str>>, node: NodeId) {
+        let error = |msg: String| {
+            self.emit(Diagnostic::error(ident.span, msg, None, self.source_idx));
+        };
 
-        let parent = Rc::clone(&self.module_tree);
-        let mut guard = self.subguard(&mut index, Some(lexed.tokens()), Some(source));
-        guard.module_tree = parent.child(name, subdir);
+        let Some(module_tree) = &self.module_tree else {
+            return error(format!(
+                "cannot include module `{}` from a source that is not on disk",
+                ident.item
+            ));
+        };
 
-        let parse_result = guard.with(InlineModule::parse);
-        if *guard.index != guard.stream.len() {
-            return Err(ParseError::InputNotConsumed(self.peek()?.span));
+        match self.ctx.sources.load_from_mod(module_tree, &ident.item) {
+            Ok(LoadedModule {
+                idx,
+                subdir,
+                fresh: true,
+            }) => {
+                let tree = module_tree.child(ident.item, subdir);
+                let module = self.ctx.parse_source(idx, Some(tree)).unwrap_or_else(|e| {
+                    e.display(idx, &self.ctx.diagnostics);
+                    InlineModule::default()
+                });
+
+                self.ctx.ast_table.insert(idx, node, module);
+            }
+            Ok(LoadedModule { fresh: false, .. }) => error(format!(
+                "the file of module `{}` is already part of the compilation",
+                ident.item
+            )),
+            Err(SourceFileError::NoMatches) => error(format!(
+                "failed to find file `{name}.{ext}` or `{name}/mod.{ext}`",
+                name = ident.item,
+                ext = SOURCE_EXTENSION,
+            )),
+            Err(e) => error(format!(
+                "failed to read source for module `{}`: {e}",
+                ident.item
+            )),
         }
-
-        self.ast_table.insert(source, node, parse_result?);
-
-        Ok(())
     }
 }
 
 /// Paths.
 pub mod path {
-    use std::{fmt::Debug, ops::Deref};
+    use std::ops::Deref;
 
     use lexer::{Intern, TokenKind};
     use span::Spanned;
 
-    use crate::{KEYWORDS, Parse, ParseGuard, ParseResult};
+    use crate::{CRATE, Parse, ParseError, ParseGuard, ParseResult, SUPER, is_keyword};
 
     /// A path.
     #[derive(Debug, Clone, PartialEq)]
@@ -521,41 +703,29 @@ pub mod path {
     }
 
     /// A path segment.
-    #[derive(Clone, Copy, PartialEq)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub struct Segment {
-        ptr: *const u8,
-        tagged_len: usize,
+        name: Intern<str>,
+        is_kw: bool,
     }
 
     impl Segment {
-        /// The position of the `is_kw` bit.
-        pub const SHIFT: usize = (usize::BITS - 1) as usize;
-        /// The maximum size a segment can have.
-        pub const MAX_SIZE: usize = 1 << Self::SHIFT;
-
         /// Create a new segment.
         pub fn new(segment: impl Into<Intern<str>>, is_kw: bool) -> Self {
-            let segment = segment.into();
-            debug_assert!(segment.len() < Self::MAX_SIZE);
-            let ptr = segment.as_ptr();
-            let len = segment.len();
-            let tagged_len = if is_kw { len | 1 << Self::SHIFT } else { len };
-
-            Self { ptr, tagged_len }
+            Self {
+                name: segment.into(),
+                is_kw,
+            }
         }
 
-        /// Whether this is a keyword or not.
+        /// Whether this is a keyword (`crate` or `super`) or not.
         pub const fn is_kw(self) -> bool {
-            (self.tagged_len as isize) < 0
+            self.is_kw
         }
 
         /// Retrieve an interned representation of the underlying string.
-        pub fn as_intern_str(&self) -> Intern<str> {
-            const {
-                assert!(size_of::<&'static str>() == size_of::<Intern<str>>());
-            }
-
-            unsafe { core::mem::transmute(&**self) }
+        pub const fn as_intern_str(&self) -> Intern<str> {
+            self.name
         }
     }
 
@@ -564,23 +734,13 @@ pub mod path {
 
         #[inline]
         fn deref(&self) -> &Self::Target {
-            let actual_len = self.tagged_len & !(1 << Self::SHIFT);
-            unsafe { std::str::from_raw_parts(self.ptr, actual_len) }
-        }
-    }
-
-    impl Debug for Segment {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("Segment")
-                .field("segment", &self.deref())
-                .field("is_kw", &self.is_kw())
-                .finish()
+            &self.name
         }
     }
 
     impl PartialEq<Intern<str>> for Segment {
         fn eq(&self, other: &Intern<str>) -> bool {
-            self.ptr == other.as_ptr()
+            self.name == *other
         }
     }
 
@@ -605,28 +765,29 @@ pub mod path {
     }
 
     impl Parse for Path {
-        fn is_ok(&self) -> bool {
-            self.segments.iter().all(|x| !x.item.is_kw())
-        }
-
-        fn parse<'diag, 'source, 'index, 'a>(
-            mut guard: ParseGuard<'diag, 'source, 'index, 'a>,
-        ) -> ParseResult<Self> {
-            // using new guard so that it's atomic
-            let is_fully_qualified = guard.spanning(consume_double_colon).is_ok();
-            let first = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
-            let first_is_kw = KEYWORDS.iter().any(|x| ***x == first.item);
-            let mut segments = vec![first.map(|x| Segment::new(x, first_is_kw))];
+        fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+            let is_fully_qualified = guard.with(consume_double_colon).is_ok();
+            let mut segments = vec![];
 
             loop {
-                if guard.spanning(consume_double_colon).is_err() {
-                    break;
+                let token = guard.next_require(TokenKind::Ident)?;
+                let name = token.item.symbol;
+                let is_kw = is_keyword(name);
+
+                // only `crate` and `super` may be used, and only as the first segment
+                let kw_allowed = segments.is_empty()
+                    && !is_fully_qualified
+                    && (name == *CRATE || name == *SUPER);
+
+                if is_kw && !kw_allowed {
+                    return Err(ParseError::KwAsIdent(name, token.span));
                 }
 
-                let segment = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
-                let is_kw = KEYWORDS.iter().any(|x| ***x == segment.item);
+                segments.push(Spanned::new(token.span, Segment::new(name, is_kw)));
 
-                segments.push(segment.map(|x| Segment::new(x, is_kw)));
+                if guard.with(consume_double_colon).is_err() {
+                    break;
+                }
             }
 
             Ok(Self {
@@ -636,23 +797,22 @@ pub mod path {
         }
     }
 
-    fn consume_double_colon(mut guard: ParseGuard) -> ParseResult<Spanned<()>> {
+    fn consume_double_colon(mut guard: ParseGuard) -> ParseResult<()> {
+        let first = guard.next_require(TokenKind::Colon)?;
         guard
-            .next_require(TokenKind::Colon)
-            .and_then(|_| guard.next_require(TokenKind::Colon))
-            .map(|x| x.map(|_| ()))
+            .next_adjacent(first.span, TokenKind::Colon)
+            .map(|_| ())
+            .ok_or(ParseError::TokenMismatch(
+                smallvec::smallvec![TokenKind::Colon],
+                first.span,
+            ))
     }
 }
 
 /// A parser.
 pub trait Parse: Sized {
     /// Attempt to parse an item.
-    fn parse<'diag, 'source, 'index, 'a>(
-        guard: ParseGuard<'diag, 'source, 'index, 'a>,
-    ) -> ParseResult<Self>;
-
-    /// Specify which state of this can be interpreted as a successfully parsed element.
-    fn is_ok(&self) -> bool;
+    fn parse<'source, 'index>(guard: ParseGuard<'source, 'index>) -> ParseResult<Self>;
 }
 
 #[cfg(test)]
@@ -664,6 +824,8 @@ where
     assert_eq_custom_parser(T::parse, input, other.item, Some(other.span))
 }
 
+/// Parse `input` with `clbk`, and assert that all input was consumed and that the result equals
+/// `other` (and its span equals `span`, if given).
 #[cfg(test)]
 #[track_caller]
 fn assert_eq_custom_parser<T, F, E>(clbk: F, input: impl Into<String>, other: T, span: Option<Span>)
@@ -672,73 +834,89 @@ where
     T: PartialEq + std::fmt::Debug,
     E: std::fmt::Debug,
 {
-    use source::{SourceFile, SourceMap};
+    use source::SourceFile;
 
-    let mut sources = SourceMap::new();
-    let source_file = SourceFile::from_memory(input.into());
-    let source_idx = sources.insert(source_file);
-    let mut diagnostics = Diagnostics::default();
+    let sources = SourceMap::new();
+    let source_idx = sources.insert(SourceFile::from_memory(input.into()));
+    let diagnostics = Diagnostics::default();
 
-    let lexed = match Lexer::new(&sources, source_idx, &mut diagnostics).lex() {
-        Ok(r) => r,
-        Err(_) => {
-            eprintln!("Failed to lex input, diagnostics following: ");
+    let Ok(lexed) = Lexer::new(&sources, source_idx, diagnostics.clone()).lex() else {
+        diagnostics.write_stderr(&sources).unwrap();
+        panic!("failed to lex input");
+    };
+
+    let mut index = 0;
+    let mut guard = ParseGuard {
+        ctx: ParseContext {
+            diagnostics: diagnostics.clone(),
+            sources: sources.clone(),
+            ast_table: AstTable::default(),
+            crate_table: CrateTable::default(),
+        },
+        index: &mut index,
+        stream: lexed.tokens(),
+        source_idx,
+        module_tree: None,
+    };
+
+    let parsed = match guard.spanning(clbk) {
+        Ok(v) => v,
+        Err(e) => {
             diagnostics.write_stderr(&sources).unwrap();
-            panic!()
+            panic!("failed to parse input: {e:#?}");
         }
     };
 
-    let ast_table = AstTable::default();
-    let mut parser = Parser::new(&mut sources, source_idx, &mut diagnostics, &ast_table);
-    let mut guard = parser.guard(lexed.tokens());
+    assert_eq!(
+        *guard.index,
+        lexed.tokens().len(),
+        "not all tokens were consumed"
+    );
 
-    // prob not the best way to do this
+    pretty_assertions::assert_eq!(other, parsed.item);
     if let Some(span) = span {
-        let parse_res = guard.spanning(clbk);
+        pretty_assertions::assert_eq!(span, parsed.span);
+    }
+}
 
-        if *guard.index != lexed.tokens().len() {
-            ParseError::InputNotConsumed(lexed.tokens().last().unwrap().span)
-                .display(source_idx, &mut diagnostics);
-        }
+/// Parse `input` with `clbk` and return the error it fails with.
+#[cfg(test)]
+#[track_caller]
+fn parse_err<T, F>(clbk: F, input: &str) -> (ParseError, Vec<String>)
+where
+    F: FnOnce(ParseGuard) -> ParseResult<T>,
+    T: std::fmt::Debug,
+{
+    use source::SourceFile;
 
-        let parse_res = match parse_res {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Failed to parse input. Error: {e:#?}. Diagnostics: ");
-                diagnostics.write_stdout(&sources).unwrap();
-                panic!();
-            }
-        };
+    let sources = SourceMap::new();
+    let source_idx = sources.insert(SourceFile::from_memory(input.to_owned()));
+    let diagnostics = Diagnostics::default();
+    let lexed = Lexer::new(&sources, source_idx, diagnostics.clone())
+        .lex()
+        .unwrap();
 
-        let other = Spanned::new(span, other);
-
-        pretty_assertions::assert_eq!(other, parse_res)
-    } else {
-        let parsed = match guard.with(clbk) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Failed to parse input. Error: {e:#?}. Diagnostics: ");
-                diagnostics.write_stdout(&sources).unwrap();
-                panic!();
-            }
-        };
-
-        if *guard.index != lexed.tokens().len() {
-            diagnostics.push(Diagnostic::error(
-                lexed
-                    .tokens()
-                    .first()
-                    .unwrap()
-                    .span
-                    .extend(lexed.tokens().last().unwrap().span),
-                "not all tokens were consumed",
-                None,
-                source_idx,
-            ));
-        }
-
-        pretty_assertions::assert_eq!(other, parsed)
+    let mut index = 0;
+    let mut guard = ParseGuard {
+        ctx: ParseContext {
+            diagnostics: diagnostics.clone(),
+            sources: sources.clone(),
+            ast_table: AstTable::default(),
+            crate_table: CrateTable::default(),
+        },
+        index: &mut index,
+        stream: lexed.tokens(),
+        source_idx,
+        module_tree: None,
     };
+
+    let err = guard.with(clbk).expect_err("parse should fail");
+    err.display(source_idx, &diagnostics);
+    let mut out = vec![];
+    diagnostics.write(&sources, &mut out).unwrap();
+    let rendered = String::from_utf8(out).unwrap();
+
+    (err, rendered.lines().map(ToOwned::to_owned).collect())
 }
 
 #[cfg(test)]
@@ -747,7 +925,7 @@ mod tests {
     use span::{Span, Spanned};
 
     use crate::{
-        assert_eq,
+        ParseError, assert_eq, parse_err,
         path::{Path, Segment},
     };
 
@@ -791,5 +969,28 @@ mod tests {
             "tmp",
             Path::single(Spanned::new(Span::new(0, 3), Intern::from("tmp"))),
         );
+    }
+
+    #[test]
+    fn parse_super_path() {
+        assert_eq(
+            "super::x",
+            Spanned::new(
+                Span::new(0, 8),
+                Path {
+                    is_fully_qualified: false,
+                    segments: vec![
+                        Spanned::new(Span::new(0, 5), Segment::new("super", true)),
+                        Spanned::new(Span::new(7, 8), Segment::new("x", false)),
+                    ],
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn keyword_in_path_is_rejected() {
+        let (err, _) = parse_err(<Path as crate::Parse>::parse, "a::loop");
+        assert!(matches!(err, ParseError::KwAsIdent(..)), "{err:?}");
     }
 }

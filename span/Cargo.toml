@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 derive_more = { version = "2.1.1", features = ["deref", "deref_mut"] }
+
+[lints]
+workspace = true

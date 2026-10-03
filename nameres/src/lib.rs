@@ -25,9 +25,45 @@ pub struct NameResTable {
     table: IndexVec<NameResId, SymbolInfo>,
 }
 
+impl NameResTable {
+    /// Retrieve the information about a symbol.
+    pub fn get(&self, id: NameResId) -> &SymbolInfo {
+        &self.table[id]
+    }
+}
+
 define_index_type! {
     /// A pointer to a scope within an arena.
     pub struct ScopeId = u32;
+}
+
+/// The kind of a scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeKind {
+    /// The root of a crate.
+    CrateRoot,
+    /// A module (inline or included from a file).
+    Module,
+    /// The scope of an item, e.g., the generics of a type or the arguments of a function.
+    Item,
+    /// A block.
+    Block,
+}
+
+impl ScopeKind {
+    /// Whether this scope is a module boundary, i.e., a module or a crate root.
+    pub const fn is_module(self) -> bool {
+        matches!(self, Self::CrateRoot | Self::Module)
+    }
+}
+
+/// The namespace of a symbol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Namespace {
+    /// Types and modules.
+    Type,
+    /// Functions and values.
+    Value,
 }
 
 /// A scope arena.
@@ -42,68 +78,103 @@ impl ScopeArena {
         Self::default()
     }
 
-    /// Create a scope with the given parent and whether this is the root of a file.
-    pub fn create_scope(&mut self, parent: Option<ScopeId>, root: Option<SourceIdx>) -> ScopeId {
+    /// Create a scope with the given parent and kind. `source` must be set if this scope is the
+    /// root of a file.
+    pub fn create_scope(
+        &mut self,
+        parent: Option<ScopeId>,
+        kind: ScopeKind,
+        source: Option<SourceIdx>,
+    ) -> ScopeId {
         self.scopes.push(Scope {
             values: HashMap::new(),
             types: HashMap::new(),
-            root,
             parent,
+            kind,
+            source,
         })
     }
 
-    /// Lookup a symbol. This traverses scopes upwards.
-    pub fn lookup(&self, start: ScopeId, symbol: Intern<str>) -> Option<(NameResId, ScopeId)> {
-        let mut current = Some(start);
-        while let Some(id) = current {
-            if let Some(nr_id) = self.scopes[id].values.get(&symbol) {
-                return Some((*nr_id, id));
-            }
-            current = self.scopes[id].parent;
-        }
-        None
+    /// Retrieve a scope.
+    pub fn get(&self, scope: ScopeId) -> &Scope {
+        &self.scopes[scope]
     }
 
-    /// Lookup a type. This traverses scopes upwards.
-    pub fn lookup_ty(&self, start: ScopeId, symbol: Intern<str>) -> Option<(NameResId, ScopeId)> {
-        let mut current = Some(start);
-        while let Some(id) = current {
-            if let Some(nr_id) = self.scopes[id].types.get(&symbol) {
-                return Some((*nr_id, id));
-            }
-
-            current = self.scopes[id].parent;
+    pub(crate) fn table_mut(&mut self, scope: ScopeId, ns: Namespace) -> &mut SymbolTable {
+        let scope = &mut self.scopes[scope];
+        match ns {
+            Namespace::Type => &mut scope.types,
+            Namespace::Value => &mut scope.values,
         }
-        None
     }
 
-    /// Lookup any kind of symbol. This traverses scopes upwards.
-    pub fn lookup_any(&self, start: ScopeId, symbol: Intern<str>) -> Option<(NameResId, ScopeId)> {
-        self.lookup_ty(start, symbol)
-            .or_else(|| self.lookup(start, symbol))
+    /// Lookup a symbol in exactly the given scope, preferring types over values.
+    pub fn get_any(&self, scope: ScopeId, symbol: Intern<str>) -> Option<NameResId> {
+        let scope = &self.scopes[scope];
+        scope
+            .types
+            .get(&symbol)
+            .or_else(|| scope.values.get(&symbol))
+            .copied()
+    }
+
+    /// Lookup a symbol lexically, preferring types over values within each scope.
+    ///
+    /// This traverses scopes upwards, up to and including the closest module. Items of outer
+    /// modules are not visible; they must be imported or referenced via `crate::`/`super::`.
+    pub fn lookup_any(&self, start: ScopeId, symbol: Intern<str>) -> Option<NameResId> {
+        let mut current = start;
+        loop {
+            if let Some(id) = self.get_any(current, symbol) {
+                return Some(id);
+            }
+
+            let scope = &self.scopes[current];
+            match scope.parent {
+                Some(parent) if !scope.kind.is_module() => current = parent,
+                _ => return None,
+            }
+        }
+    }
+
+    /// Retrieve the closest module (or crate root) containing this scope, including itself.
+    pub fn nearest_module(&self, mut scope: ScopeId) -> ScopeId {
+        while !self.scopes[scope].kind.is_module() {
+            scope = self.scopes[scope]
+                .parent
+                .expect("logic violation: scope outside of a module");
+        }
+
+        scope
+    }
+
+    /// Retrieve the parent module of the given module. Returns [`None`] for crate roots.
+    pub fn parent_module(&self, module: ScopeId) -> Option<ScopeId> {
+        self.scopes[module]
+            .parent
+            .map(|parent| self.nearest_module(parent))
     }
 
     /// Lookup the root of the crate containing this scope.
-    pub fn lookup_crate_scope(&self, scope_id: ScopeId) -> ScopeId {
-        let scope = &self.scopes[scope_id];
-
-        if let Some(parent) = scope.parent {
-            self.lookup_crate_scope(parent)
-        } else {
-            scope_id
+    pub fn crate_root(&self, mut scope: ScopeId) -> ScopeId {
+        while let Some(parent) = self.scopes[scope].parent {
+            scope = parent;
         }
+
+        scope
     }
 
     /// Lookup the file of this scope.
-    pub fn lookup_root(&self, scope: ScopeId) -> SourceIdx {
-        let scope = &self.scopes[scope];
+    pub fn lookup_root(&self, mut scope: ScopeId) -> SourceIdx {
+        loop {
+            let data = &self.scopes[scope];
+            if let Some(source) = data.source {
+                return source;
+            }
 
-        if let Some(root) = scope.root {
-            root
-        } else if let Some(parent) = scope.parent {
-            self.lookup_root(parent)
-        } else {
-            panic!("logic violation: scope without parent or source file reference")
+            scope = data
+                .parent
+                .expect("logic violation: scope without parent or source file reference");
         }
     }
 }
@@ -117,13 +188,20 @@ pub struct Scope {
     types: SymbolTable,
     /// The parent.
     parent: Option<ScopeId>,
-    /// Whether this is the root of a file.
-    root: Option<SourceIdx>,
+    /// The kind of scope.
+    kind: ScopeKind,
+    /// The file this scope is the root of, if any.
+    source: Option<SourceIdx>,
 }
 
 impl Scope {
     /// Retrieve the ID of parent scope.
     pub fn parent(&self) -> Option<ScopeId> {
         self.parent
+    }
+
+    /// Retrieve the kind of this scope.
+    pub fn kind(&self) -> ScopeKind {
+        self.kind
     }
 }

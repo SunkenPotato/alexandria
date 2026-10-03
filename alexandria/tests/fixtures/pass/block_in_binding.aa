@@ -1,0 +1,6 @@
+product i {}
+func main {} {
+    decl x: i = { 1 };
+    decl ~y = loop { break x };
+    y;
+}

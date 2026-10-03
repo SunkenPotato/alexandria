@@ -1,0 +1,4 @@
+product i {}
+func main {} { decl x: i = x; }
+//~ error: could not find `x` in scope
+//~ error: aborting due to 1 previous error

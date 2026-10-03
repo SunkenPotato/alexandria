@@ -1,0 +1,3 @@
+func main {} { 1 + ; }
+//~ error: expected one of `(`, integer literal, string literal, `{` or identifier
+//~ error: aborting due to 1 previous error

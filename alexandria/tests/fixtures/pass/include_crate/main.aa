@@ -1,0 +1,3 @@
+include crate std;
+static X: std::T = std::V;
+//= --crates std=tests/fixtures/pass/include_crate/std.aa
