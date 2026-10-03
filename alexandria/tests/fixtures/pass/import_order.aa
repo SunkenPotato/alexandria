@@ -1,0 +1,5 @@
+import a::X;
+static V: X = 1;
+
+module a { import super::b::X; }
+module b { pub product X {} }

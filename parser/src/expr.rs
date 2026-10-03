@@ -5,10 +5,8 @@ use node::Node;
 use span::{Span, Spanned};
 
 use crate::{
-    BREAK, CONTINUE, ELSE, IF, LOOP, Parse, ParseError, ParseGuard, ParseResult, RETURN,
-    expr::literal::Literal,
-    path::Path,
-    stmt::{Binding, Stmt},
+    BREAK, CONTINUE, DECL, ELSE, IF, LOOP, Parse, ParseError, ParseGuard, ParseResult, RETURN,
+    expr::literal::Literal, item::Item, path::Path, stmt::Stmt,
 };
 
 /// An expression.
@@ -21,15 +19,6 @@ pub enum Expr {
 }
 
 impl Parse for Expr {
-    fn is_ok(&self) -> bool {
-        match self {
-            Expr::Base(base) => base.is_ok(),
-            Expr::Binary(binary) => {
-                binary.lhs.item.is_ok() && binary.op.item.is_ok() && binary.rhs.item.is_ok()
-            }
-        }
-    }
-
     fn parse<'source, 'index>(guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         Self::parse_1(guard, 0)
     }
@@ -59,6 +48,18 @@ impl Expr {
     }
 }
 
+/// Check whether a token of the given kind may start an expression.
+fn starts_expr(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::LParen
+            | TokenKind::Integer
+            | TokenKind::StringLit
+            | TokenKind::LCurly
+            | TokenKind::Ident
+    )
+}
+
 /// A binary expression.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BinaryExpr {
@@ -83,7 +84,7 @@ pub enum BinaryOp {
     Div,
     /// `%`.
     Rem,
-    /// `=`.
+    /// `==`.
     Eq,
     /// `!=`.
     NotEq,
@@ -112,61 +113,37 @@ pub enum BinaryOp {
 }
 
 impl Parse for BinaryOp {
-    fn is_ok(&self) -> bool {
-        true
-    }
-
-    fn parse<'source, 'index>(
-        mut guard: crate::ParseGuard<'source, 'index>,
-    ) -> crate::ParseResult<Self> {
+    /// Parse an operator. Operators made up of two tokens (e.g., `<=`) must not contain
+    /// whitespace.
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let next = guard.next()?;
+        let mut adjacent = |kind| guard.next_adjacent(next.span, kind).is_some();
+
         let op = match next.item.kind {
             TokenKind::Plus => Self::Add,
             TokenKind::Minus => Self::Sub,
             TokenKind::Asterisk => Self::Mul,
             TokenKind::Slash => Self::Div,
             TokenKind::Percent => Self::Rem,
-            TokenKind::Equal => {
-                guard.next_require(TokenKind::Equal)?;
-                Self::Eq
-            }
-            TokenKind::Bang => {
-                guard.next_require(TokenKind::Equal)?;
-                Self::NotEq
-            }
-            TokenKind::LessThan => {
-                if guard.next_require(TokenKind::LessThan).is_ok() {
-                    Self::Shl
-                } else if guard.next_require(TokenKind::Equal).is_ok() {
-                    Self::Le
-                } else {
-                    Self::Lt
-                }
-            }
-            TokenKind::GreaterThan => {
-                if guard.next_require(TokenKind::GreaterThan).is_ok() {
-                    Self::Shr
-                } else if guard.next_require(TokenKind::Equal).is_ok() {
-                    Self::Ge
-                } else {
-                    Self::Gt
-                }
-            }
-            TokenKind::Ampersand => {
-                if guard.next_require(TokenKind::Ampersand).is_ok() {
-                    Self::And
-                } else {
-                    Self::BitAnd
-                }
-            }
-            TokenKind::Pipe => {
-                if guard.next_require(TokenKind::Pipe).is_ok() {
-                    Self::Or
-                } else {
-                    Self::BitOr
-                }
-            }
+            TokenKind::Equal if adjacent(TokenKind::Equal) => Self::Eq,
+            TokenKind::Bang if adjacent(TokenKind::Equal) => Self::NotEq,
+            TokenKind::LessThan if adjacent(TokenKind::LessThan) => Self::Shl,
+            TokenKind::LessThan if adjacent(TokenKind::Equal) => Self::Le,
+            TokenKind::LessThan => Self::Lt,
+            TokenKind::GreaterThan if adjacent(TokenKind::GreaterThan) => Self::Shr,
+            TokenKind::GreaterThan if adjacent(TokenKind::Equal) => Self::Ge,
+            TokenKind::GreaterThan => Self::Gt,
+            TokenKind::Ampersand if adjacent(TokenKind::Ampersand) => Self::And,
+            TokenKind::Ampersand => Self::BitAnd,
+            TokenKind::Pipe if adjacent(TokenKind::Pipe) => Self::Or,
+            TokenKind::Pipe => Self::BitOr,
             TokenKind::Caret => Self::BitXor,
+            TokenKind::Equal | TokenKind::Bang => {
+                return Err(ParseError::TokenMismatch(
+                    smallvec::smallvec![TokenKind::Equal],
+                    Span::new(next.span.stop(), next.span.stop()),
+                ));
+            }
             _ => {
                 return Err(ParseError::TokenMismatch(
                     smallvec::smallvec![
@@ -175,13 +152,7 @@ impl Parse for BinaryOp {
                         TokenKind::Asterisk,
                         TokenKind::Slash,
                         TokenKind::Percent,
-                        TokenKind::Equal,
-                        TokenKind::Bang,
                         TokenKind::LessThan,
-                        TokenKind::GreaterThan,
-                        TokenKind::Ampersand,
-                        TokenKind::Pipe,
-                        TokenKind::Caret,
                     ],
                     next.span,
                 ));
@@ -193,25 +164,31 @@ impl Parse for BinaryOp {
 }
 
 impl BinaryOp {
-    /// The precedence of this operation. The order is as follows: \
-    /// 1. `*,/,%` \
-    /// 2. `+,-` \
-    /// 3. `<<,>>` \
-    /// 4. `<,<=,>,>=` \
-    /// 5. `==,!=,&&,&,||,|,^`
+    /// The precedence of this operation. From the tightest to the loosest binding: \
+    /// 1. `*`, `/`, `%` \
+    /// 2. `+`, `-` \
+    /// 3. `<<`, `>>` \
+    /// 4. `<`, `<=`, `>`, `>=` \
+    /// 5. `==`, `!=` \
+    /// 6. `&` \
+    /// 7. `^` \
+    /// 8. `|` \
+    /// 9. `&&` \
+    /// 10. `||`
+    ///
+    /// All operators are left-associative.
     pub const fn precedence(&self) -> u8 {
         match self {
-            BinaryOp::Eq
-            | BinaryOp::NotEq
-            | BinaryOp::And
-            | BinaryOp::BitAnd
-            | BinaryOp::Or
-            | BinaryOp::BitOr
-            | BinaryOp::BitXor => 10,
-            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Ge | BinaryOp::Gt => 20,
-            BinaryOp::Shr | BinaryOp::Shl => 30,
-            BinaryOp::Add | BinaryOp::Sub => 40,
-            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => 50,
+            BinaryOp::Or => 10,
+            BinaryOp::And => 20,
+            BinaryOp::BitOr => 30,
+            BinaryOp::BitXor => 40,
+            BinaryOp::BitAnd => 50,
+            BinaryOp::Eq | BinaryOp::NotEq => 60,
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Ge | BinaryOp::Gt => 70,
+            BinaryOp::Shr | BinaryOp::Shl => 80,
+            BinaryOp::Add | BinaryOp::Sub => 90,
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => 100,
         }
     }
 }
@@ -243,103 +220,79 @@ pub enum BaseExpr {
 }
 
 impl Parse for BaseExpr {
-    fn is_ok(&self) -> bool {
-        match self {
-            Self::Literal(v) => v.is_ok(),
-            Self::Path(v) => v.is_ok(),
-            Self::Block(v) | Self::Loop(v) => v.is_ok(),
-            Self::FnCall(v) => v.object.item.is_ok() && v.args.iter().all(|x| x.item.is_ok()),
-            Self::Parenthesized(v) => v.is_ok(),
-            Self::Conditional(v) => v.is_ok(),
-            Self::Continue => true,
-            Self::Break(v) | Self::Return(v) => v.as_ref().is_none_or(|x| x.item.is_ok()),
-        }
-    }
-
-    fn parse<'source, 'index>(
-        mut guard: crate::ParseGuard<'source, 'index>,
-    ) -> crate::ParseResult<Self> {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         if guard.next_require(TokenKind::LParen).is_ok() {
             let expr = Box::new(guard.with(Expr::parse)?);
             guard.next_require(TokenKind::RParen)?;
-            Ok(Self::Parenthesized(expr))
+            return Ok(Self::Parenthesized(expr));
+        }
+
+        let object = guard.spanning(Self::parse_object)?;
+
+        if guard.peek_kind(TokenKind::LParen) {
+            let args = guard.parse_delimited(TokenKind::LParen, TokenKind::RParen, Expr::parse)?;
+
+            Ok(Self::FnCall(FnCall {
+                object: Box::new(object),
+                args,
+            }))
         } else {
-            let object = Box::new(
-                guard
-                    .spanning(Literal::parse)
-                    .map(|x| x.map(Self::Literal))
-                    .or_else(|_| {
-                        guard
-                            .spanning(ConditionalExpr::parse)
-                            .map(|x| x.map(Self::Conditional))
-                    })
-                    .or_else(|_| guard.spanning(parse_kw_with_expr(*BREAK, BaseExpr::Break)))
-                    .or_else(|_| guard.spanning(parse_kw_with_expr(*RETURN, BaseExpr::Return)))
-                    .or_else(|_| guard.spanning(parse_continue))
-                    .or_else(|_| guard.spanning(parse_loop))
-                    .or_else(|_| {
-                        guard
-                            .spanning(|mut g| match g.with(Path::parse) {
-                                Ok(v) if v.is_ok() => Ok(v),
-                                Ok(_) => Err(ParseError::InternalParseError),
-                                Err(e) => Err(e),
-                            })
-                            .map(|sp| Spanned {
-                                item: BaseExpr::Path(Node::new(sp.span, sp.item)),
-                                span: sp.span,
-                            })
-                    })
-                    .or_else(|_| {
-                        guard
-                            .spanning(Block::parse)
-                            .map(|x| Spanned::new(x.span, Self::Block(Node::from(x))))
-                    })?,
-            );
+            Ok(object.item)
+        }
+    }
+}
 
-            if guard.next_require(TokenKind::LParen).is_ok() {
-                let mut args = vec![];
+impl BaseExpr {
+    /// Parse a base expression, excluding calls and parenthesized expressions.
+    fn parse_object(mut guard: ParseGuard) -> ParseResult<Self> {
+        let token = guard.peek()?;
 
-                while let Ok(arg) = guard.spanning(Expr::parse) {
-                    args.push(arg);
-                    if guard.next_require(TokenKind::Comma).is_ok() {
-                        if guard.next_require(TokenKind::RParen).is_ok() {
-                            break;
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        guard.next_require(TokenKind::RParen)?;
-                    }
-                }
-
-                Ok(Self::FnCall(FnCall { object, args }))
-            } else {
-                Ok(object.item)
+        match token.item.kind {
+            TokenKind::Integer | TokenKind::StringLit => {
+                guard.with(Literal::parse).map(Self::Literal)
             }
+            TokenKind::LCurly => guard
+                .spanning(Block::parse)
+                .map(|x| Self::Block(Node::from(x))),
+            TokenKind::Ident => {
+                let symbol = token.item.symbol;
+
+                if symbol == *IF {
+                    guard.with(ConditionalExpr::parse).map(Self::Conditional)
+                } else if symbol == *LOOP {
+                    guard.with(parse_loop)
+                } else if symbol == *CONTINUE {
+                    guard.next()?;
+                    Ok(Self::Continue)
+                } else if symbol == *BREAK {
+                    guard.with(parse_kw_with_expr(*BREAK, Self::Break))
+                } else if symbol == *RETURN {
+                    guard.with(parse_kw_with_expr(*RETURN, Self::Return))
+                } else {
+                    guard
+                        .spanning(Path::parse)
+                        .map(|x| Self::Path(Node::from(x)))
+                }
+            }
+            _ => Err(ParseError::TokenMismatch(
+                smallvec::smallvec![
+                    TokenKind::LParen,
+                    TokenKind::Integer,
+                    TokenKind::StringLit,
+                    TokenKind::LCurly,
+                    TokenKind::Ident,
+                ],
+                token.span,
+            )),
         }
     }
 }
 
 fn parse_loop(mut guard: ParseGuard) -> ParseResult<BaseExpr> {
-    let kw = guard.next_require(TokenKind::Ident)?;
-
-    if kw.item.symbol != *LOOP {
-        return Err(ParseError::ExpectedKw(*LOOP, kw.span));
-    }
-
+    guard.expect_kw(*LOOP)?;
     let block = guard.spanning(Block::parse)?;
 
     Ok(BaseExpr::Loop(Node::from(block)))
-}
-
-fn parse_continue(mut guard: ParseGuard) -> ParseResult<BaseExpr> {
-    let kw = guard.next_require(TokenKind::Ident)?;
-
-    if kw.item.symbol != *CONTINUE {
-        return Err(ParseError::ExpectedKw(*LOOP, kw.span));
-    }
-
-    Ok(BaseExpr::Continue)
 }
 
 fn parse_kw_with_expr(
@@ -347,13 +300,13 @@ fn parse_kw_with_expr(
     mapper: impl Fn(Option<Box<Spanned<Expr>>>) -> BaseExpr,
 ) -> impl Fn(ParseGuard) -> ParseResult<BaseExpr> {
     move |mut guard| {
-        let next = guard.next_require(TokenKind::Ident)?;
+        guard.expect_kw(kw)?;
 
-        if next.item.symbol != kw {
-            return Err(ParseError::ExpectedKw(kw, next.span));
-        }
-
-        let expr = guard.spanning(Expr::parse).ok().map(Box::new);
+        let expr = if guard.peek().is_ok_and(|x| starts_expr(x.item.kind)) {
+            Some(Box::new(guard.spanning(Expr::parse)?))
+        } else {
+            None
+        };
 
         Ok(mapper(expr))
     }
@@ -377,13 +330,6 @@ pub mod literal {
     }
 
     impl Parse for Literal {
-        fn is_ok(&self) -> bool {
-            match self {
-                Self::Int(v) => v.is_ok(),
-                Self::Str(v) => v.is_ok(),
-            }
-        }
-
         fn parse<'source, 'index>(
             guard: crate::ParseGuard<'source, 'index>,
         ) -> crate::ParseResult<Self> {
@@ -409,21 +355,24 @@ pub mod literal {
     }
 
     impl Parse for IntegerLiteral {
-        fn is_ok(&self) -> bool {
-            matches!(self, Self::Ok(..))
-        }
-
         fn parse<'source, 'index>(
             mut guard: crate::ParseGuard<'source, 'index>,
         ) -> crate::ParseResult<Self> {
             let next = guard.next_require(TokenKind::Integer)?;
-            let Some(int) = next.item.symbol.chars().try_fold(0u128, |c, next| {
-                c.checked_mul(10)
-                    .and_then(|c| c.checked_add((next as u32 - 0x30) as u128))
-            }) else {
-                guard.diagnostics.push(Diagnostic::error(
+            let value =
+                next.item
+                    .symbol
+                    .chars()
+                    .filter(|x| *x != '_')
+                    .try_fold(0u128, |acc, digit| {
+                        acc.checked_mul(10)?
+                            .checked_add(u128::from(digit.to_digit(10)?))
+                    });
+
+            let Some(value) = value else {
+                guard.emit(Diagnostic::error(
                     next.span,
-                    "integer literal overflow: integer literals have a maximum capacity of 2^128",
+                    "integer literal overflow: integer literals have a maximum value of 2^128 - 1",
                     None,
                     guard.source_idx,
                 ));
@@ -431,7 +380,7 @@ pub mod literal {
                 return Ok(Self::Overflow);
             };
 
-            Ok(Self::Ok(int))
+            Ok(Self::Ok(value))
         }
     }
 
@@ -445,48 +394,48 @@ pub mod literal {
     }
 
     impl Parse for StringLiteral {
-        fn is_ok(&self) -> bool {
-            matches!(self, Self::Ok(..))
-        }
-
         fn parse<'source, 'index>(
             mut guard: crate::ParseGuard<'source, 'index>,
         ) -> crate::ParseResult<Self> {
             let token = guard.next_require(TokenKind::StringLit)?;
-            let mut buf = String::with_capacity(token.item.symbol.len());
+            let symbol = token.item.symbol;
+            let mut buf = String::with_capacity(symbol.len());
 
-            let mut iter = token.item.symbol.chars().enumerate().skip(1);
+            // skip the opening quote
+            let mut iter = symbol.char_indices().skip(1);
             let mut is_fail = false;
             while let Some((i, strch)) = iter.next() {
                 let to_append = match strch {
                     '\\' => {
-                        let esc_ch = iter.next().unwrap();
-                        match esc_ch.1 {
+                        // an unterminated literal; the lexer has already reported it
+                        let Some((j, esc)) = iter.next() else {
+                            break;
+                        };
+
+                        match esc {
                             't' => '\t',
                             'n' => '\n',
                             '0' => '\0',
                             '"' => '"',
                             '\\' => '\\',
-                            '{' => {
-                                guard.diagnostics.push(Diagnostic::error(
-                                    Span::new(
-                                        token.span.start() + i as u32,
-                                        token.span.start() + esc_ch.0 as u32,
-                                    ),
-                                    "unicode escapes are not yet supported",
+                            other => {
+                                let span = Span::new(
+                                    token.span.start() + i as u32,
+                                    token.span.start() + (j + other.len_utf8()) as u32,
+                                );
+                                let message = if other == '{' {
+                                    "unicode escapes are not yet supported".to_owned()
+                                } else {
+                                    format!("`\\{other}` is not a valid escape sequence")
+                                };
+
+                                guard.emit(Diagnostic::error(
+                                    span,
+                                    message,
                                     None,
                                     guard.source_idx,
                                 ));
                                 is_fail = true;
-                                continue;
-                            }
-                            other => {
-                                guard.diagnostics.push(Diagnostic::error(
-                                    token.span,
-                                    format!("'{other}' is not an escape character"),
-                                    None,
-                                    guard.source_idx,
-                                ));
                                 continue;
                             }
                         }
@@ -517,36 +466,34 @@ pub struct Block {
 }
 
 impl Parse for Block {
-    fn is_ok(&self) -> bool {
-        self.stmts.iter().all(|x| x.item.is_ok())
-            && self.tail.as_ref().is_none_or(|x| x.item.is_ok())
-    }
-
     fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         guard.next_require(TokenKind::LCurly)?;
         let mut stmts = vec![];
+        let mut tail = None;
+
         loop {
-            if let Ok(b) = guard.spanning(Binding::parse) {
-                stmts.push(b.map(Stmt::Binding));
+            match guard.next_require(TokenKind::RCurly) {
+                Ok(_) => break,
+                Err(e @ ParseError::Eof(..)) => return Err(e),
+                Err(_) => (),
+            }
+
+            if Item::starts_item(&guard) || guard.peek_kw(*DECL) {
+                stmts.push(guard.spanning(Stmt::parse)?);
                 continue;
             }
 
-            let tail = if let Ok(mut expr) = guard.spanning(Expr::parse) {
-                if let Ok(v) = guard.next_require(TokenKind::Semicolon) {
-                    expr.span = expr.span.extend(v.span);
-                    stmts.push(expr.map(Stmt::ExprSemi));
-                    continue;
-                } else {
-                    Some(Box::new(expr))
-                }
+            let expr = guard.spanning(Expr::parse)?;
+            if let Ok(semi) = guard.next_require(TokenKind::Semicolon) {
+                stmts.push(expr.extend(semi.span).map(Stmt::ExprSemi));
             } else {
-                None
-            };
-
-            guard.next_require(TokenKind::RCurly)?;
-
-            return Ok(Self { stmts, tail });
+                tail = Some(Box::new(expr));
+                guard.next_require(TokenKind::RCurly)?;
+                break;
+            }
         }
+
+        Ok(Self { stmts, tail })
     }
 }
 
@@ -571,31 +518,21 @@ pub struct ConditionalExpr {
 }
 
 impl Parse for ConditionalExpr {
-    fn is_ok(&self) -> bool {
-        self.main.item.is_ok()
-            && self.alternatives.iter().all(|x| x.item.is_ok())
-            && self.fallback.as_ref().is_none_or(|x| x.item.is_ok())
-    }
-
     fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let main = guard.spanning(ConditionalBlock::parse)?;
         let mut alternatives = vec![];
+        let mut fallback = None;
 
-        while let Ok(block) = guard.spanning(ConditionalBlock::parse_else_if) {
-            alternatives.push(block);
-        }
+        while guard.peek_kw(*ELSE) {
+            guard.next()?;
 
-        let fallback = 'a: {
-            let Ok(else_kw) = guard.next_require(TokenKind::Ident) else {
-                break 'a None;
-            };
-
-            if else_kw.item.symbol != *ELSE {
-                break 'a None;
+            if guard.peek_kw(*IF) {
+                alternatives.push(guard.spanning(ConditionalBlock::parse)?);
+            } else {
+                fallback = Some(guard.spanning(Block::parse)?.into());
+                break;
             }
-
-            guard.spanning(Block::parse).ok().map(Into::into)
-        };
+        }
 
         Ok(Self {
             main,
@@ -614,29 +551,9 @@ pub struct ConditionalBlock {
     pub block: Node<Block>,
 }
 
-impl ConditionalBlock {
-    fn parse_else_if(mut guard: ParseGuard) -> ParseResult<Self> {
-        let else_kw = guard.next_require(TokenKind::Ident)?;
-        if else_kw.item.symbol != *ELSE {
-            return Err(ParseError::ExpectedKw(else_kw.item.symbol, else_kw.span));
-        }
-
-        let block = guard.with(Self::parse)?;
-
-        Ok(block)
-    }
-}
-
 impl Parse for ConditionalBlock {
-    fn is_ok(&self) -> bool {
-        self.condition.item.is_ok() && self.block.item.is_ok()
-    }
-
     fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
-        let kw = guard.next_require(TokenKind::Ident)?;
-        if kw.item.symbol != *IF {
-            return Err(ParseError::ExpectedKw(kw.item.symbol, kw.span));
-        }
+        guard.expect_kw(*IF)?;
 
         guard.next_require(TokenKind::LParen)?;
         let condition = Box::new(guard.spanning(Expr::parse)?);
@@ -1002,5 +919,249 @@ mod tests {
                 ))),
             ),
         )
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use lexer::Intern;
+    use span::{Span, Spanned};
+
+    use crate::{
+        Parse, ParseError, assert_eq_custom_parser,
+        expr::{
+            BaseExpr, Block, Expr, FnCall,
+            literal::{IntegerLiteral, Literal, StringLiteral},
+        },
+        parse_err,
+        path::Path,
+        stmt::{Binding, Stmt},
+    };
+
+    fn int(span: Span, v: u128) -> Box<Spanned<Expr>> {
+        Box::new(Spanned::new(
+            span,
+            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(v)))),
+        ))
+    }
+
+    fn path(span: Span, name: &str) -> BaseExpr {
+        BaseExpr::Path(Path::single(Spanned::new(span, Intern::from(name))).into())
+    }
+
+    /// Render the structure of an expression, e.g. `((1 == 2) && (3 == 4))`.
+    fn shape(expr: &Expr) -> String {
+        match expr {
+            Expr::Binary(b) => format!("({} {:?} {})", shape(&b.lhs), b.op.item, shape(&b.rhs)),
+            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(v)))) => v.to_string(),
+            Expr::Base(other) => format!("{other:?}"),
+        }
+    }
+
+    fn parse_shape(input: &str) -> String {
+        let mut out = None;
+        assert_eq_custom_parser(
+            |g| {
+                let e = Expr::parse(g)?;
+                out = Some(shape(&e));
+                Ok::<_, ParseError>(())
+            },
+            input,
+            (),
+            None,
+        );
+        out.unwrap()
+    }
+
+    #[test]
+    fn zero_arg_call() {
+        assert_eq_custom_parser(
+            Expr::parse,
+            "f()",
+            Expr::Base(BaseExpr::FnCall(FnCall {
+                object: Box::new(Spanned::new(Span::new(0, 1), path(Span::new(0, 1), "f"))),
+                args: vec![],
+            })),
+            Some(Span::new(0, 3)),
+        );
+    }
+
+    #[test]
+    fn call_with_trailing_comma() {
+        assert_eq_custom_parser(
+            Expr::parse,
+            "f(1,)",
+            Expr::Base(BaseExpr::FnCall(FnCall {
+                object: Box::new(Spanned::new(Span::new(0, 1), path(Span::new(0, 1), "f"))),
+                args: vec![*int(Span::new(2, 3), 1)],
+            })),
+            Some(Span::new(0, 5)),
+        );
+    }
+
+    #[test]
+    fn precedence_levels() {
+        assert_eq!(parse_shape("1 == 2 && 3 == 4"), "((1 Eq 2) And (3 Eq 4))");
+        assert_eq!(parse_shape("1 || 2 && 3"), "(1 Or (2 And 3))");
+        assert_eq!(
+            parse_shape("1 | 2 ^ 3 & 4"),
+            "(1 BitOr (2 BitXor (3 BitAnd 4)))"
+        );
+        assert_eq!(parse_shape("1 & 2 == 3"), "(1 BitAnd (2 Eq 3))");
+        assert_eq!(parse_shape("1 - 2 - 3"), "((1 Sub 2) Sub 3)");
+    }
+
+    #[test]
+    fn two_token_operators_must_be_adjacent() {
+        assert_eq!(parse_shape("1 <= 2"), "(1 Le 2)");
+        let (err, _) = parse_err(Expr::parse, "1 < < 2");
+        assert!(matches!(err, ParseError::TokenMismatch(..)), "{err:?}");
+    }
+
+    #[test]
+    fn integer_with_separators() {
+        assert_eq_custom_parser(
+            Literal::parse,
+            "1_000",
+            Literal::Int(IntegerLiteral::Ok(1000)),
+            None,
+        );
+    }
+
+    #[test]
+    fn string_with_trailing_backslash_does_not_panic() {
+        // the lexer reports the unclosed literal; the parser must not panic on it
+        assert_eq_custom_parser(
+            Literal::parse,
+            r#""ab\"#,
+            Literal::Str(StringLiteral::Ok(Intern::from("ab"))),
+            None,
+        );
+    }
+
+    #[test]
+    fn string_with_unknown_escape_is_invalid() {
+        assert_eq_custom_parser(
+            Literal::parse,
+            r#""\q""#,
+            Literal::Str(StringLiteral::InvalidEsc),
+            None,
+        );
+    }
+
+    #[test]
+    fn non_ascii_string() {
+        assert_eq_custom_parser(
+            Literal::parse,
+            "\"é\\n\"",
+            Literal::Str(StringLiteral::Ok(Intern::from("é\n"))),
+            Some(Span::new(0, 6)),
+        );
+    }
+
+    #[test]
+    fn conditional_does_not_consume_following_ident() {
+        // previously `x` was silently swallowed while looking for `else`
+        let (err, _) = parse_err(Block::parse, "{ if (1) { 2 } x }");
+        assert!(
+            matches!(err, ParseError::TokenMismatch(_, span) if span == Span::new(15, 16)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn else_if_else_chain() {
+        let mut out = None;
+        assert_eq_custom_parser(
+            |g| {
+                let e = Expr::parse(g)?;
+                out = Some(e);
+                Ok::<_, ParseError>(())
+            },
+            "if (1) { 1 } else if (2) { 2 } else { 3 }",
+            (),
+            None,
+        );
+
+        let Some(Expr::Base(BaseExpr::Conditional(cond))) = out else {
+            panic!("expected a conditional");
+        };
+        assert_eq!(cond.alternatives.len(), 1);
+        assert!(cond.fallback.is_some());
+    }
+
+    #[test]
+    fn binding_without_type() {
+        assert_eq_custom_parser(
+            Stmt::parse,
+            "decl x = 5;",
+            Stmt::Binding(Binding {
+                is_mutable: None,
+                ident: Spanned::new(Span::new(5, 6), Intern::from("x")),
+                ty: None,
+                value: Spanned::new(
+                    Span::new(9, 10),
+                    Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                ),
+            }),
+            Some(Span::new(0, 11)),
+        );
+    }
+
+    #[test]
+    fn block_with_item() {
+        let mut out = None;
+        assert_eq_custom_parser(
+            |g| {
+                let b = Block::parse(g)?;
+                out = Some(b);
+                Ok::<_, ParseError>(())
+            },
+            "{ func inner {} { } inner() }",
+            (),
+            None,
+        );
+
+        let block = out.unwrap();
+        assert!(matches!(block.stmts[0].item, Stmt::Item(_)));
+        assert!(block.tail.is_some());
+    }
+
+    #[test]
+    fn return_without_value_before_brace() {
+        assert_eq_custom_parser(
+            Block::parse,
+            "{ return }",
+            Block {
+                stmts: vec![],
+                tail: Some(Box::new(Spanned::new(
+                    Span::new(2, 8),
+                    Expr::Base(BaseExpr::Return(None)),
+                ))),
+            },
+            None,
+        );
+    }
+
+    #[test]
+    fn syntax_error_points_at_offending_token() {
+        let (err, rendered) = parse_err(Block::parse, "{ 1 + ; }");
+        assert!(matches!(err, ParseError::TokenMismatch(_, span) if span == Span::new(6, 7)));
+        assert!(
+            rendered[0].starts_with("error: expected one of"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_as_binding_name() {
+        let (err, _) = parse_err(Stmt::parse, "decl loop = 1;");
+        assert!(matches!(err, ParseError::KwAsIdent(..)), "{err:?}");
+    }
+
+    #[test]
+    fn wrong_keyword_is_reported_as_expected() {
+        let (err, _) = parse_err(Expr::parse, "if 1");
+        assert!(matches!(err, ParseError::TokenMismatch(..)), "{err:?}");
     }
 }

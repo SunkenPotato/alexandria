@@ -1,0 +1,2 @@
+module m { pub product A {} }
+static X: m::A = 1;

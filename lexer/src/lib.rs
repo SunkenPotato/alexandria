@@ -65,8 +65,6 @@ pub enum TokenKind {
     RCurly,
     /// `|`.
     Pipe,
-    /// An invalid token kind. Used internally only.
-    Invalid,
     /// An integer. This excludes any sign.
     Integer,
     /// A string literal.
@@ -76,12 +74,50 @@ pub enum TokenKind {
 }
 
 impl TokenKind {
-    /// Check whether this is an atom, i.e., a constant token.
+    /// Check whether this is an atom, i.e., a token whose text is always the same.
     pub const fn is_atom(&self) -> bool {
         !matches!(
             self,
             TokenKind::Integer | TokenKind::StringLit | TokenKind::Ident
         )
+    }
+}
+
+impl std::fmt::Display for TokenKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use TokenKind::*;
+
+        let text = match self {
+            Bang => "`!`",
+            Caret => "`^`",
+            Ampersand => "`&`",
+            Asterisk => "`*`",
+            LParen => "`(`",
+            RParen => "`)`",
+            Plus => "`+`",
+            Equal => "`=`",
+            Minus => "`-`",
+            Slash => "`/`",
+            LessThan => "`<`",
+            GreaterThan => "`>`",
+            Colon => "`:`",
+            Semicolon => "`;`",
+            Comma => "`,`",
+            Dot => "`.`",
+            Question => "`?`",
+            Tilde => "`~`",
+            Percent => "`%`",
+            LBracket => "`[`",
+            RBracket => "`]`",
+            LCurly => "`{`",
+            RCurly => "`}`",
+            Pipe => "`|`",
+            Integer => "integer literal",
+            StringLit => "string literal",
+            Ident => "identifier",
+        };
+
+        f.write_str(text)
     }
 }
 
@@ -152,7 +188,15 @@ impl<'s> Lexer<'s> {
                 '+' => Plus,
                 '=' => Equal,
                 '-' => Minus,
-                '/' => Slash,
+                '/' => {
+                    if self.peek().is_some_and(|x| matches!(x, '/' | '*')) {
+                        self.consume_comment();
+                        self.cursor.commit();
+                        continue;
+                    } else {
+                        Slash
+                    }
+                }
                 '<' => LessThan,
                 '>' => GreaterThan,
                 ':' => Colon,
@@ -201,12 +245,7 @@ impl<'s> Lexer<'s> {
     }
 
     /// Emit the given diagnostic.
-    pub(crate) fn emit(
-        &mut self,
-        level: DiagnosticLevel,
-        message: impl Into<String>,
-        suggestion: Option<String>,
-    ) {
+    fn emit(&self, level: DiagnosticLevel, message: impl Into<String>, suggestion: Option<String>) {
         let span = Span::new(self.cursor.committed as u32, self.cursor.cursor as u32);
         self.diagnostics.push(Diagnostic::new(
             Some(span),
@@ -254,19 +293,47 @@ impl<'s> Lexer<'s> {
         }
     }
 
+    fn consume_comment(&mut self) {
+        match self.next().unwrap() {
+            '/' => {
+                while let Some(x) = self.peek()
+                    && x != '\n'
+                {
+                    _ = self.next();
+                }
+            }
+            '*' => loop {
+                let Some(first) = self.next() else {
+                    self.emit(
+                        DiagnosticLevel::Error,
+                        "unterminated comment",
+                        Some("add a `*/` at the end".to_owned()),
+                    );
+                    return;
+                };
+
+                if first == '*' && self.next() == Some('/') {
+                    break;
+                }
+            },
+            _ => unreachable!(),
+        };
+    }
+
     /// Advance the cursor of the lexer.
-    #[expect(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<char> {
-        self.iter.next().inspect(|_| self.cursor.next())
+    fn next(&mut self) -> Option<char> {
+        self.iter
+            .next()
+            .inspect(|c| self.cursor.advance(c.len_utf8()))
     }
 
     /// Peek the next character.
-    pub fn peek(&self) -> Option<char> {
+    fn peek(&self) -> Option<char> {
         self.iter.clone().next()
     }
 
     /// Commit the text consumed so far and create a new token from it.
-    pub fn commit(&mut self, kind: TokenKind) -> Spanned<Token> {
+    fn commit(&mut self, kind: TokenKind) -> Spanned<Token> {
         let start = self.cursor.committed;
         let stop = self.cursor.cursor;
         let symbol = &self.source[start..stop];
@@ -277,39 +344,29 @@ impl<'s> Lexer<'s> {
     }
 }
 
-/// A commitable cursor.
+/// A commitable cursor. Positions are byte offsets into the source.
 #[derive(Default)]
-pub struct Cursor {
+struct Cursor {
     cursor: usize,
     committed: usize,
 }
 
 impl Cursor {
     /// Construct a new cursor.
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             cursor: 0,
             committed: 0,
         }
     }
 
-    /// Advance the cursor.
-    pub const fn next(&mut self) {
-        self.cursor += 1;
+    /// Advance the cursor by `len` bytes.
+    const fn advance(&mut self, len: usize) {
+        self.cursor += len;
     }
 
     /// Commit the cursor.
-    pub const fn commit(&mut self) {
+    const fn commit(&mut self) {
         self.committed = self.cursor;
-    }
-
-    /// Rollback to the last commit.
-    pub const fn rollback(&mut self) {
-        self.cursor = self.committed;
-    }
-
-    /// Retrieve the current cursor.
-    pub const fn get(&self) -> usize {
-        self.cursor
     }
 }

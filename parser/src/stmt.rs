@@ -2,13 +2,12 @@
 //!
 //! Statements are executable pieces of code that do not evaluate to a value.
 
-use diagnostic::Diagnostic;
 use lexer::{Intern, TokenKind};
 use node::Node;
 use span::{Span, Spanned};
 
 use crate::{
-    DECL, Parse, ParseError,
+    DECL, Parse,
     expr::Expr,
     item::{Item, Type},
 };
@@ -25,26 +24,18 @@ pub enum Stmt {
 }
 
 impl Parse for Stmt {
-    fn is_ok(&self) -> bool {
-        match self {
-            Self::Binding(v) => v.is_ok(),
-            Self::ExprSemi(v) => v.is_ok(),
-            Self::Item(_) => true,
-        }
-    }
-
     fn parse<'source, 'index>(
         mut guard: crate::ParseGuard<'source, 'index>,
     ) -> crate::ParseResult<Self> {
-        guard.with(Item::parse).map(Self::Item).or_else(|_| {
-            guard.with(Binding::parse).map(Self::Binding).or_else(|_| {
-                guard.with(|mut g| {
-                    let expr = g.with(Expr::parse)?;
-                    g.next_require(TokenKind::Semicolon)?;
-                    Ok(Self::ExprSemi(expr))
-                })
-            })
-        })
+        if Item::starts_item(&guard) {
+            guard.with(Item::parse).map(Self::Item)
+        } else if guard.peek_kw(*DECL) {
+            guard.with(Binding::parse).map(Self::Binding)
+        } else {
+            let expr = guard.with(Expr::parse)?;
+            guard.next_require(TokenKind::Semicolon)?;
+            Ok(Self::ExprSemi(expr))
+        }
     }
 }
 
@@ -62,41 +53,19 @@ pub struct Binding {
 }
 
 impl Parse for Binding {
-    fn is_ok(&self) -> bool {
-        true
-    }
-
     fn parse<'source, 'index>(
         mut guard: crate::ParseGuard<'source, 'index>,
     ) -> crate::ParseResult<Self> {
-        let decl = guard.next_require(TokenKind::Ident)?;
-        if decl.item.symbol != *DECL {
-            return Err(ParseError::ExpectedKw(*DECL, decl.span));
-        }
+        guard.expect_kw(*DECL)?;
 
-        let is_mutable = match guard.next_require(TokenKind::Tilde) {
-            Ok(v) => Some(v.span),
-            Err(ParseError::TokenMismatch { .. }) => {
-                let this = guard.peek().unwrap();
-                if this.item.kind != TokenKind::Ident {
-                    guard.diagnostics.push(Diagnostic::error(
-                        this.span,
-                        format!("expected `~` or Ident, got {:?}", this.item.kind),
-                        None,
-                        guard.source_idx,
-                    ));
-                }
+        let is_mutable = guard.next_require(TokenKind::Tilde).ok().map(|x| x.span);
+        let ident = guard.expect_ident()?;
 
-                None
-            }
-            Err(e) => return Err(e),
+        let ty = if guard.next_require(TokenKind::Colon).is_ok() {
+            Some(guard.spanning(Type::parse)?)
+        } else {
+            None
         };
-
-        let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
-        let ty = guard
-            .next_require(TokenKind::Colon)
-            .and_then(|_| guard.spanning(Type::parse))
-            .map(Some)?;
 
         guard.next_require(TokenKind::Equal)?;
 

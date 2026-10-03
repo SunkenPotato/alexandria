@@ -1,24 +1,29 @@
 //! The resolver machinery.
 
-use std::{collections::HashMap, iter::once};
+use std::{
+    collections::{HashMap, HashSet},
+    iter::once,
+};
 
 use diagnostic::{Diagnostic, Diagnostics};
+use lexer::Intern;
 use node::{Node, NodeId};
 use parser::{
     CRATE, SUPER,
     ast_table::AstTable,
-    crate_table::CrateTable,
+    crate_table::{CrateId, CrateTable},
     expr::{BaseExpr, Block, Expr},
     item::{
-        FnDef, GlobalDef, GlobalDefKind, IncludeDef, InlineModule, Item, ProductDef, SumDef, Type,
+        FnDef, GlobalDef, GlobalDefKind, IncludeCrate, IncludeDef, InlineModule, Item, Module,
+        ProductDef, SumDef, Type,
     },
     path::Path,
     stmt::Stmt,
 };
-use source::SourceIdx;
+use span::Spanned;
 
 use crate::{
-    NameResId, NameResTable, ScopeArena, ScopeId,
+    NameResId, NameResTable, Namespace, ScopeArena, ScopeId, ScopeKind,
     sym_info::{SymbolInfo, SymbolKind},
 };
 
@@ -28,24 +33,58 @@ pub struct SubscopeTable {
     table: HashMap<NodeId, ScopeId>,
 }
 
+impl SubscopeTable {
+    /// Retrieve the scope defined by a node.
+    pub fn get(&self, node: NodeId) -> Option<ScopeId> {
+        self.table.get(&node).copied()
+    }
+}
+
 /// A table mapping nodes to name resolution IDs.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ResolutionTable {
     table: HashMap<NodeId, NameResId>,
 }
 
+impl ResolutionTable {
+    /// Retrieve the symbol a node resolves to.
+    pub fn get(&self, node: NodeId) -> Option<NameResId> {
+        self.table.get(&node).copied()
+    }
+}
+
+/// The tables produced by name resolution.
+#[derive(Default, Debug)]
+pub struct NameResOutput {
+    /// The scopes.
+    pub arena: ScopeArena,
+    /// Information about every symbol.
+    pub nrt: NameResTable,
+    /// The scopes defined by nodes.
+    pub subscopes: SubscopeTable,
+    /// The symbols paths resolve to.
+    pub resolutions: ResolutionTable,
+}
+
+/// An import that has not been resolved yet.
+struct PendingImport {
+    path: Path,
+    scope: ScopeId,
+    node: NodeId,
+}
+
 /// The name resolver.
-pub struct Resolver<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast> {
-    arena: &'arena mut ScopeArena,
-    nrt: &'nrt mut NameResTable,
-    subscopes: &'sscopes mut SubscopeTable,
-    diagnostics: &'diag mut Diagnostics,
-    resolutions: &'res mut ResolutionTable,
-    entrypoint: SourceIdx,
+pub struct Resolver<'ast> {
+    out: NameResOutput,
+    diagnostics: Diagnostics,
     ast_table: &'ast AstTable,
     crate_table: CrateTable,
-    imports: Vec<(*const Path, ScopeId)>,
-    root: ScopeId,
+    entry: CrateId,
+    /// The root scope of every registered crate.
+    crate_scopes: HashMap<CrateId, ScopeId>,
+    /// The crates whose items have been resolved.
+    resolved_crates: HashSet<CrateId>,
+    imports: Vec<PendingImport>,
 }
 
 /// A resolution error.
@@ -57,54 +96,106 @@ pub enum ResolutionError {
     ResError,
 }
 
-impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
-    Resolver<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
-{
-    /// Create a new resolver.
-    #[expect(clippy::too_many_arguments)]
+impl<'ast> Resolver<'ast> {
+    /// Create a new resolver for the crate `entry`.
     pub fn new(
-        arena: &'arena mut ScopeArena,
-        nrt: &'nrt mut NameResTable,
-        subscopes: &'sscopes mut SubscopeTable,
-        diagnostics: &'diag mut Diagnostics,
-        resolutions: &'res mut ResolutionTable,
         ast_table: &'ast AstTable,
         crate_table: CrateTable,
-        entrypoint: SourceIdx,
+        entry: CrateId,
+        diagnostics: Diagnostics,
     ) -> Self {
-        let root = arena.create_scope(None, Some(entrypoint));
-
         Self {
-            arena,
-            nrt,
-            subscopes,
+            out: NameResOutput::default(),
             diagnostics,
-            resolutions,
-            entrypoint,
             ast_table,
             crate_table,
-            root,
+            entry,
+            crate_scopes: HashMap::new(),
+            resolved_crates: HashSet::new(),
             imports: vec![],
         }
     }
 
-    /// Resolve the given inputs.
-    pub fn fill(mut self) -> Result<(), ResolutionError> {
-        self.register();
-
-        let mut diags = self.diagnostics.len();
+    /// Resolve the given inputs. Errors are reported as diagnostics.
+    pub fn fill(mut self) -> Result<NameResOutput, ResolutionError> {
+        let errors = self.diagnostics.error_count();
+        self.register_crate(self.entry);
         self.register_imports();
-        if diags != self.diagnostics.len() {
+        if errors != self.diagnostics.error_count() {
             return Err(ResolutionError::RegError);
         }
 
-        diags = self.diagnostics.len();
-        self.resolve();
-        if diags != self.diagnostics.len() {
+        self.resolve_crate(self.entry);
+        if errors != self.diagnostics.error_count() {
             return Err(ResolutionError::ResError);
         }
 
-        Ok(())
+        Ok(self.out)
+    }
+
+    fn subscope(&self, node: NodeId) -> ScopeId {
+        self.out
+            .subscopes
+            .get(node)
+            .expect("logic violation: node without a registered subscope")
+    }
+
+    /// Insert `name` into the given scope, reporting a diagnostic if it is already defined.
+    fn insert_name(
+        &mut self,
+        scope: ScopeId,
+        ns: Namespace,
+        name: Spanned<Intern<str>>,
+        id: NameResId,
+    ) {
+        let Some(prev) = self.out.arena.table_mut(scope, ns).insert(name.item, id) else {
+            return;
+        };
+
+        let prev = self.out.nrt.table[prev];
+        let source = self.out.arena.lookup_root(scope);
+        self.diagnostics.push(
+            Diagnostic::error(
+                name.span,
+                format!("`{}` is defined multiple times", name.item),
+                None,
+                source,
+            )
+            .with_secondary_in(prev.source(), prev.span()),
+        );
+    }
+
+    /// Define a new symbol in the given scope.
+    fn define(
+        &mut self,
+        scope: ScopeId,
+        name: Spanned<Intern<str>>,
+        kind: SymbolKind,
+    ) -> NameResId {
+        let source = self.out.arena.lookup_root(scope);
+        let id = self
+            .out
+            .nrt
+            .table
+            .push(SymbolInfo::new(kind, name.span, source));
+
+        self.insert_name(scope, kind.namespace(), name, id);
+        id
+    }
+
+    /// Define a local variable. Unlike [`Self::define`], this allows shadowing.
+    fn bind(&mut self, scope: ScopeId, name: Spanned<Intern<str>>, mutable: bool) {
+        let source = self.out.arena.lookup_root(scope);
+        let id = self.out.nrt.table.push(SymbolInfo::new(
+            SymbolKind::Variable(mutable),
+            name.span,
+            source,
+        ));
+
+        self.out
+            .arena
+            .table_mut(scope, Namespace::Value)
+            .insert(name.item, id);
     }
 }
 
@@ -112,13 +203,25 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
 // FIRST PASS // HOISTING                          //
 /////////////////////////////////////////////////////
 
-impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
-    Resolver<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
-{
-    fn register(&mut self) {
-        let entrypoint_items = self.ast_table.by_src(self.entrypoint);
+impl Resolver<'_> {
+    /// Register the items of a crate, if not done yet, and return its root scope.
+    fn register_crate(&mut self, id: CrateId) -> ScopeId {
+        if let Some(&scope) = self.crate_scopes.get(&id) {
+            return scope;
+        }
 
-        self.register_module(&entrypoint_items.items, self.root);
+        let source = self.crate_table.get(id).root;
+        let root = self
+            .out
+            .arena
+            .create_scope(None, ScopeKind::CrateRoot, Some(source));
+        // insert before registering the items, so that cyclic crate includes terminate
+        self.crate_scopes.insert(id, root);
+
+        let ast = self.ast_table.by_src(source);
+        self.register_module(&ast.items, root);
+
+        root
     }
 
     fn register_module(&mut self, items: &[Node<Item>], scope: ScopeId) {
@@ -131,19 +234,20 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
         match item.item {
             Item::ConstDef(def) | Item::StaticDef(def) => self.register_glob_def(def, scope),
             Item::FnDef(fndef) => self.register_fn_def(item.map(|_| fndef), scope),
-            // ... so we don't really know whether the thing we're importing goes into the type
-            // or value namespace. we'll handle this in the second pass. for now, we'll just make record of it.
-            Item::Import(imp) => self.imports.push((imp.path(), scope)),
-            Item::Module(module) => {
-                let subscope = self.arena.create_scope(Some(scope), None);
-                let info = SymbolInfo::new(SymbolKind::Module(subscope));
-                self.arena.scopes[scope]
-                    .types
-                    .insert(module.ident.item, self.nrt.table.push(info));
-                self.register_module(&module.module.items, subscope);
+            // we don't know whether the thing we're importing goes into the type or value
+            // namespace yet. imports are registered once all items are known.
+            Item::Import(imp) => self.imports.push(PendingImport {
+                path: imp.path().clone(),
+                scope,
+                node: item.id(),
+            }),
+            Item::Module(module) => self.register_inline_module(item.map(|_| module), scope),
+            Item::ProductDef(prod) => {
+                self.register_type_def(item.id(), prod.ident, prod.generics.as_ref(), scope)
             }
-            Item::ProductDef(prod) => self.register_prod_def(item.map(|_| prod), scope),
-            Item::SumDef(sum) => self.register_sum_def(item.map(|_| sum), scope),
+            Item::SumDef(sum) => {
+                self.register_type_def(item.id(), sum.ident, sum.generics.as_ref(), scope)
+            }
             Item::Include(include) => self.register_include(item.map(|_| include), scope),
             Item::IncludeCrate(include) => {
                 self.register_include_crate(item.map(|_| include), scope)
@@ -151,143 +255,110 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
         }
     }
 
-    fn register_glob_def(&mut self, def: &parser::item::GlobalDef, scope: ScopeId) {
-        let info = SymbolInfo::new(SymbolKind::Variable(def.kind == GlobalDefKind::Static));
-
-        self.arena.scopes[scope]
-            .values
-            .insert(def.ident.item, self.nrt.table.push(info));
+    fn register_glob_def(&mut self, def: &GlobalDef, scope: ScopeId) {
+        self.define(
+            scope,
+            def.ident,
+            SymbolKind::Variable(def.kind == GlobalDefKind::Static),
+        );
 
         self.register_expr(&def.value.item, scope);
     }
 
-    fn register_fn_def(&mut self, fndef: Node<&FnDef>, scope: ScopeId) {
-        let info = SymbolInfo::new(SymbolKind::Function(fndef.args.len()));
-        self.arena.scopes[scope]
-            .values
-            .insert(fndef.item.ident.item, self.nrt.table.push(info));
-
-        let subscope = self.arena.create_scope(Some(scope), None);
-        self.subscopes.table.insert(fndef.id(), subscope);
-
-        if let Some(generics) = &fndef.item.generics {
-            let ty_info = SymbolInfo::new(SymbolKind::Type {
-                generics: 0,
-                subscope: None,
-            });
-
-            for generic in &generics.item {
-                self.arena.scopes[subscope]
-                    .types
-                    .insert(generic.item, self.nrt.table.push(ty_info));
-            }
+    fn register_generics(
+        &mut self,
+        generics: Option<&Spanned<Vec<Spanned<Intern<str>>>>>,
+        scope: ScopeId,
+    ) {
+        for generic in generics.into_iter().flat_map(|x| &x.item) {
+            self.define(
+                scope,
+                *generic,
+                SymbolKind::Type {
+                    generics: 0,
+                    subscope: None,
+                },
+            );
         }
+    }
+
+    fn register_fn_def(&mut self, fndef: Node<&FnDef>, scope: ScopeId) {
+        self.define(scope, fndef.ident, SymbolKind::Function(fndef.args.len()));
+
+        let subscope = self
+            .out
+            .arena
+            .create_scope(Some(scope), ScopeKind::Item, None);
+        self.out.subscopes.table.insert(fndef.id(), subscope);
+
+        self.register_generics(fndef.generics.as_ref(), subscope);
 
         // TODO: change when function argument mutability is introduced
-        let arg_info = SymbolInfo::new(SymbolKind::Variable(true));
         for arg in &fndef.args {
-            self.arena.scopes[subscope]
-                .values
-                .insert(arg.ident.item, self.nrt.table.push(arg_info));
+            self.define(subscope, arg.ident, SymbolKind::Variable(true));
         }
 
         self.register_block(fndef.item.block.as_ref(), scope, Some(subscope));
     }
 
-    fn register_prod_def(&mut self, prod_def: Node<&ProductDef>, scope: ScopeId) {
-        let n_generics = prod_def
-            .generics
-            .as_ref()
-            .map(|x| x.len())
-            .unwrap_or_default();
+    fn register_inline_module(&mut self, module: Node<&Module>, scope: ScopeId) {
+        let subscope = self
+            .out
+            .arena
+            .create_scope(Some(scope), ScopeKind::Module, None);
+        self.define(scope, module.ident, SymbolKind::Module(subscope));
+        self.out.subscopes.table.insert(module.id(), subscope);
 
-        let subscope = self.arena.create_scope(Some(scope), None);
-
-        self.arena.scopes[scope].types.insert(
-            prod_def.ident.item,
-            self.nrt.table.push(SymbolInfo::new(SymbolKind::Type {
-                generics: n_generics,
-                subscope: Some(subscope),
-            })),
-        );
-
-        self.subscopes.table.insert(prod_def.id(), subscope);
-
-        let info = SymbolInfo::new(SymbolKind::Type {
-            generics: 0,
-            subscope: None,
-        });
-
-        for generic in prod_def
-            .generics
-            .as_ref()
-            .map(|x| &x.item)
-            .into_iter()
-            .flatten()
-        {
-            self.arena.scopes[subscope]
-                .types
-                .insert(generic.item, self.nrt.table.push(info));
-        }
+        self.register_module(&module.module.items, subscope);
     }
 
-    fn register_sum_def(&mut self, sum_def: Node<&SumDef>, scope: ScopeId) {
-        let n_generics = sum_def
-            .generics
-            .as_ref()
-            .map(|x| x.len())
-            .unwrap_or_default();
-
-        let subscope = self.arena.create_scope(Some(scope), None);
-        self.arena.scopes[scope].types.insert(
-            sum_def.ident.item,
-            self.nrt.table.push(SymbolInfo::new(SymbolKind::Type {
-                generics: n_generics,
+    /// Register a product or sum definition.
+    fn register_type_def(
+        &mut self,
+        node: NodeId,
+        ident: Spanned<Intern<str>>,
+        generics: Option<&Spanned<Vec<Spanned<Intern<str>>>>>,
+        scope: ScopeId,
+    ) {
+        let subscope = self
+            .out
+            .arena
+            .create_scope(Some(scope), ScopeKind::Item, None);
+        self.define(
+            scope,
+            ident,
+            SymbolKind::Type {
+                generics: generics.map(|x| x.len()).unwrap_or_default(),
                 subscope: Some(subscope),
-            })),
+            },
         );
+        self.out.subscopes.table.insert(node, subscope);
 
-        self.subscopes.table.insert(sum_def.id(), subscope);
-
-        let info = SymbolInfo::new(SymbolKind::Type {
-            generics: 0,
-            subscope: None,
-        });
-
-        for generic in sum_def
-            .generics
-            .as_ref()
-            .map(|x| &x.item)
-            .into_iter()
-            .flatten()
-        {
-            self.arena.scopes[subscope]
-                .types
-                .insert(generic.item, self.nrt.table.push(info));
-        }
+        self.register_generics(generics, subscope);
     }
 
     fn register_block(&mut self, block: Node<&Block>, scope: ScopeId, subscope: Option<ScopeId>) {
-        let subscope = subscope.unwrap_or_else(|| self.arena.create_scope(Some(scope), None));
-        self.subscopes.table.insert(block.id(), subscope);
+        let subscope = subscope.unwrap_or_else(|| {
+            self.out
+                .arena
+                .create_scope(Some(scope), ScopeKind::Block, None)
+        });
+        self.out.subscopes.table.insert(block.id(), subscope);
 
         for stmt in &block.stmts {
             self.register_stmt(&stmt.item, subscope);
+        }
+
+        if let Some(tail) = &block.tail {
+            self.register_expr(&tail.item, subscope);
         }
     }
 
     fn register_stmt(&mut self, stmt: &Stmt, scope: ScopeId) {
         match stmt {
-            Stmt::Binding(_bind) => {
-                // we actually don't want to really register bindings, because this would let us
-                // reference variables later that are defined later.
-                // _ = self.arena.scopes[scope].values.insert(
-                //     bind.ident.item,
-                //     self.nrt.table.push(SymbolInfo::new(SymbolKind::Variable(
-                //         bind.is_mutable.is_some(),
-                //     ))),
-                // );
-            }
+            // the binding itself is registered while resolving, so that it cannot be referenced
+            // before its definition. its value may contain blocks, though.
+            Stmt::Binding(bind) => self.register_expr(&bind.value.item, scope),
             Stmt::ExprSemi(ex) => self.register_expr(ex, scope),
             Stmt::Item(item) => self.register_item(item.as_ref(), scope),
         }
@@ -312,7 +383,7 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
                 self.register_expr(&ex.item, scope)
             }
             BaseExpr::Conditional(cond) => {
-                for branch in cond.alternatives.iter().chain(once(&cond.main)) {
+                for branch in once(&cond.main).chain(&cond.alternatives) {
                     self.register_expr(&branch.condition, scope);
                     self.register_block(branch.block.as_ref(), scope, None);
                 }
@@ -328,186 +399,162 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
                 }
             }
             BaseExpr::Parenthesized(paren) => self.register_expr(paren, scope),
-            _ => (),
+            BaseExpr::Literal(_)
+            | BaseExpr::Path(_)
+            | BaseExpr::Continue
+            | BaseExpr::Break(None)
+            | BaseExpr::Return(None) => (),
         }
     }
 
     fn register_include(&mut self, include: Node<&IncludeDef>, scope: ScopeId) {
         let source_id = self.ast_table.source_idx(include.id());
-        let subscope = self.arena.create_scope(Some(scope), Some(source_id));
+        let subscope = self
+            .out
+            .arena
+            .create_scope(Some(scope), ScopeKind::Module, Some(source_id));
 
-        self.arena.scopes[scope].types.insert(
-            include.ident.item,
-            self.nrt
-                .table
-                .push(SymbolInfo::new(SymbolKind::Module(subscope))),
-        );
+        self.define(scope, include.ident, SymbolKind::Module(subscope));
+        self.out.subscopes.table.insert(include.id(), subscope);
 
-        self.register_module(&self.ast_table.by_node_id(include.id()).items, subscope);
+        let ast = self.ast_table.by_node_id(include.id());
+        self.register_module(&ast.items, subscope);
     }
 
     /// Register an `include crate ...;` definition and the underlying crate.
-    pub fn register_include_crate(
-        &mut self,
-        include: Node<&parser::item::IncludeCrate>,
-        scope: ScopeId,
-    ) {
-        if include.unresolved {
+    fn register_include_crate(&mut self, include: Node<&IncludeCrate>, scope: ScopeId) {
+        // unknown crates have already been reported by the parser
+        let Some(crate_id) = include.crate_id else {
             return;
+        };
+
+        let root = self.register_crate(crate_id);
+        self.define(scope, include.ident, SymbolKind::Module(root));
+        self.out.subscopes.table.insert(include.id(), root);
+    }
+
+    /// Resolve and register all imports.
+    ///
+    /// Imports may refer to other imports, so this is repeated until no more progress is made.
+    fn register_imports(&mut self) {
+        let mut pending = std::mem::take(&mut self.imports);
+
+        loop {
+            let before = pending.len();
+            let mut failed = vec![];
+            let mut errors = vec![];
+
+            for import in pending {
+                match self.resolve_path(&import.path, import.scope) {
+                    Ok(id) => {
+                        let ns = self.out.nrt.table[id].kind().namespace();
+                        let last = import.path.segments.last().unwrap();
+                        let name = Spanned::new(last.span, last.as_intern_str());
+
+                        self.insert_name(import.scope, ns, name, id);
+                        self.out.resolutions.table.insert(import.node, id);
+                    }
+                    Err(e) => {
+                        failed.push(import);
+                        errors.push(e);
+                    }
+                }
+            }
+
+            if failed.is_empty() {
+                break;
+            }
+
+            if failed.len() == before {
+                for error in errors {
+                    self.diagnostics.push(error);
+                }
+                break;
+            }
+
+            pending = failed;
         }
-
-        let source = self
-            .crate_table
-            .status_by_name(include.ident.item)
-            .unwrap()
-            .source_idx();
-
-        let ast = self.ast_table.by_src(source);
-
-        let subscope = self.arena.create_scope(None, Some(source));
-        self.subscopes.table.insert(include.id(), subscope);
-
-        self.arena.scopes[scope].types.insert(
-            include.item.ident.item,
-            self.nrt
-                .table
-                .push(SymbolInfo::new(SymbolKind::Module(subscope))),
-        );
-
-        self.register_module(&ast.items, subscope);
     }
 }
 
 /////////////////////////////////////////////////////
-// SECOND PASS // IMPORT REG. + RESOLUTION         //
+// SECOND PASS // RESOLUTION                       //
 /////////////////////////////////////////////////////
 
-impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
-    Resolver<'arena, 'nrt, 'sscopes, 'res, 'diag, 'ast>
-{
+impl Resolver<'_> {
     fn resolve_path(&self, path: &Path, scope: ScopeId) -> Result<NameResId, Diagnostic> {
-        let source_file = self.arena.lookup_root(scope);
+        let arena = &self.out.arena;
+        let source_file = arena.lookup_root(scope);
+        let error = |span, msg: String| Diagnostic::error(span, msg, None, source_file);
+
         let first = &path.segments[0];
+        let mut prev = first;
 
-        let (mut nr_id, mut scope) = if first.item == *CRATE {
-            let scope = self.arena.lookup_crate_scope(scope);
-
-            (None, scope)
+        // the last resolved symbol, or the scope `crate`/`super` refers to
+        let mut last = if first.item == *CRATE {
+            Err(arena.crate_root(scope))
         } else if first.item == *SUPER {
-            match self.arena.scopes[scope].parent() {
-                Some(parent) => (None, parent),
+            match arena.parent_module(arena.nearest_module(scope)) {
+                Some(parent) => Err(parent),
                 None => {
-                    return Err(Diagnostic::error(
+                    return Err(error(
                         first.span,
-                        "the current scope has no parent module".to_owned(),
-                        None,
-                        source_file,
+                        "`super` cannot be used at the root of a crate".to_owned(),
                     ));
                 }
             }
         } else {
-            match self
-                .arena
-                .lookup_any(scope, path.segments[0].item.as_intern_str())
-            {
-                Some(r) => (Some(r.0), r.1),
+            match arena.lookup_any(scope, first.as_intern_str()) {
+                Some(id) => Ok(id),
                 None => {
-                    return Err(Diagnostic::error(
-                        path.segments[0].span,
-                        format!("could not find `{}` in scope", &*path.segments[0].item),
-                        None,
-                        source_file,
+                    return Err(error(
+                        first.span,
+                        format!("could not find `{}` in scope", &*first.item),
                     ));
                 }
             }
         };
 
-        let mut prev_seg = &path.segments[0];
-
         for segment in &path.segments[1..] {
-            let subscope = match nr_id {
-                Some(r) => match self.nrt.table[r].projectable() {
-                    Some(r) => r,
-                    None => {
-                        return Err(Diagnostic::error(
-                            prev_seg.span,
-                            format!("`{}` is not projectable", &*prev_seg.item),
-                            None,
-                            source_file,
-                        ));
-                    }
-                },
-                None => scope,
+            let container = match last {
+                Err(scope) => scope,
+                Ok(id) => self.out.nrt.table[id].projectable().ok_or_else(|| {
+                    error(
+                        prev.span,
+                        format!("`{}` is not a module or a type", &*prev.item),
+                    )
+                })?,
             };
 
-            let Some(next_nr_id) = self.arena.scopes[scope]
-                .types
-                .get(&segment.item.as_intern_str())
-                .or_else(|| {
-                    self.arena.scopes[scope]
-                        .values
-                        .get(&segment.item.as_intern_str())
-                })
-            else {
-                return Err(Diagnostic::error(
-                    segment.span,
-                    format!(
-                        "`{}` does not exist in `{}`",
-                        &*segment.item, &*prev_seg.item
-                    ),
-                    None,
-                    source_file,
-                ));
-            };
+            let id = arena
+                .get_any(container, segment.as_intern_str())
+                .ok_or_else(|| {
+                    error(
+                        segment.span,
+                        format!("`{}` does not exist in `{}`", &*segment.item, &*prev.item),
+                    )
+                })?;
 
-            scope = subscope;
-            nr_id = Some(*next_nr_id);
-            prev_seg = segment;
+            last = Ok(id);
+            prev = segment;
         }
 
-        let last_seg = path.segments.last().unwrap();
-        let Some((nr_id, _)) = self.arena.lookup_any(scope, last_seg.item.as_intern_str()) else {
-            return Err(Diagnostic::error(
-                last_seg.span,
-                format!(
-                    "`{}` does not exist in `{}`",
-                    &*last_seg.item, &*prev_seg.item
-                ),
-                None,
-                source_file,
-            ));
-        };
-
-        Ok(nr_id)
+        last.map_err(|_| {
+            error(
+                prev.span,
+                format!("`{}` cannot be used on its own", &*prev.item),
+            )
+        })
     }
 
-    fn register_imports(&mut self) {
-        for import in &self.imports {
-            let path = unsafe { &*import.0 };
-
-            let nr_id = match self.resolve_path(path, import.1) {
-                Ok(r) => r,
-                Err(d) => {
-                    self.diagnostics.push(d);
-                    continue;
-                }
-            };
-            let info = self.nrt.table[nr_id];
-            let target = match info.kind() {
-                SymbolKind::Function { .. } | SymbolKind::Variable { .. } => {
-                    &mut self.arena.scopes[import.1].values
-                }
-                _ => &mut self.arena.scopes[import.1].types,
-            };
-
-            target.insert(path.segments.last().unwrap().item.as_intern_str(), nr_id);
+    fn resolve_crate(&mut self, id: CrateId) {
+        if !self.resolved_crates.insert(id) {
+            return;
         }
-    }
 
-    fn resolve(&mut self) {
-        let inline_module = self.ast_table.by_src(self.entrypoint);
-
-        self.resolve_module(&inline_module, self.root);
+        let scope = self.crate_scopes[&id];
+        let ast = self.ast_table.by_src(self.crate_table.get(id).root);
+        self.resolve_module(&ast, scope);
     }
 
     fn resolve_module(&mut self, items: &InlineModule, scope: ScopeId) {
@@ -519,67 +566,52 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
     fn resolve_item(&mut self, item: Node<&Item>, scope: ScopeId) {
         match item.item {
             Item::ConstDef(def) | Item::StaticDef(def) => {
-                self.resolve_glob_def(item.map(|_| def), scope)
+                self.resolve_ty(&def.ty.item, scope);
+                self.resolve_expr(&def.value.item, scope);
             }
-            Item::FnDef(def) => self.resolve_fn_def(item.map(|_| def), scope),
-            Item::Import(imp) => {
-                let nrid = match self.resolve_path(imp.path(), scope) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.diagnostics.push(e);
-                        return;
-                    }
-                };
-
-                self.resolutions.table.insert(item.id(), nrid);
-            }
+            Item::FnDef(def) => self.resolve_fn_def(item.map(|_| def)),
+            // imports have already been resolved while registering them
+            Item::Import(_) => (),
             Item::Module(module) => {
-                let subscope = self.subscopes.table[&item.id()];
+                let subscope = self.subscope(item.id());
                 self.resolve_module(&module.module, subscope);
             }
-            Item::ProductDef(prod_def) => self.resolve_prod_def(item.map(|_| prod_def), scope),
-            Item::SumDef(sum_def) => self.resolve_sum_def(item.map(|_| sum_def), scope),
-            Item::Include(include) => self.resolve_include(item.map(|_| include)),
-            Item::IncludeCrate(include) => self.resolve_include_crate(item.map(|_| include)),
+            Item::ProductDef(ProductDef { fields, .. }) | Item::SumDef(SumDef { fields, .. }) => {
+                let subscope = self.subscope(item.id());
+                for field in fields {
+                    self.resolve_ty(&field.ty, subscope);
+                }
+            }
+            Item::Include(_) => {
+                let subscope = self.subscope(item.id());
+                let items = self.ast_table.by_node_id(item.id());
+                self.resolve_module(&items, subscope);
+            }
+            Item::IncludeCrate(include) => {
+                if let Some(id) = include.crate_id {
+                    self.resolve_crate(id);
+                }
+            }
         }
     }
 
-    fn resolve_glob_def(&mut self, glob_def: Node<&GlobalDef>, scope: ScopeId) {
-        self.resolve_ty(&glob_def.ty.item, scope);
-        self.resolve_expr(&glob_def.value.item, scope);
-    }
+    fn resolve_fn_def(&mut self, fn_def: Node<&FnDef>) {
+        let subscope = self.subscope(fn_def.id());
 
-    fn resolve_fn_def(&mut self, fn_def: Node<&FnDef>, scope: ScopeId) {
         for field in &fn_def.args {
-            self.resolve_ty(&field.ty, scope);
+            self.resolve_ty(&field.ty, subscope);
         }
 
         if let Some(ret) = &fn_def.ret_ty {
-            self.resolve_ty(ret, scope);
+            self.resolve_ty(ret, subscope);
         }
 
-        self.resolve_block(fn_def.block.as_ref(), scope);
-    }
-
-    fn resolve_prod_def(&mut self, prod_def: Node<&ProductDef>, _scope: ScopeId) {
-        let subscope = self.subscopes.table[&prod_def.id()];
-
-        for field in &prod_def.fields {
-            self.resolve_ty(&field.ty, subscope);
-        }
-    }
-
-    fn resolve_sum_def(&mut self, sum_def: Node<&SumDef>, _scope: ScopeId) {
-        let subscope = self.subscopes.table[&sum_def.id()];
-
-        for field in &sum_def.fields {
-            self.resolve_ty(&field.ty, subscope);
-        }
+        self.resolve_block(fn_def.block.as_ref());
     }
 
     fn resolve_ty(&mut self, ty: &Type, scope: ScopeId) {
         match self.resolve_path(&ty.path, scope) {
-            Ok(r) => _ = self.resolutions.table.insert(ty.path.id(), r),
+            Ok(r) => _ = self.out.resolutions.table.insert(ty.path.id(), r),
             Err(e) => self.diagnostics.push(e),
         }
 
@@ -588,13 +620,6 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
                 self.resolve_ty(generic, scope);
             }
         }
-    }
-
-    fn resolve_include(&mut self, include: Node<&IncludeDef>) {
-        let items = self.ast_table.by_node_id(include.id());
-        let subscope = self.subscopes.table[&include.id()];
-
-        self.resolve_module(&items, subscope);
     }
 
     fn resolve_expr(&mut self, expr: &Expr, scope: ScopeId) {
@@ -609,20 +634,18 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
 
     fn resolve_base_expr(&mut self, expr: &BaseExpr, scope: ScopeId) {
         match expr {
-            BaseExpr::Block(block) | BaseExpr::Loop(block) => {
-                self.resolve_block(block.as_ref(), scope)
-            }
+            BaseExpr::Block(block) | BaseExpr::Loop(block) => self.resolve_block(block.as_ref()),
             BaseExpr::Break(Some(expr)) | BaseExpr::Return(Some(expr)) => {
                 self.resolve_expr(expr, scope)
             }
             BaseExpr::Conditional(cond) => {
-                for branch in cond.alternatives.iter().chain(once(&cond.main)) {
+                for branch in once(&cond.main).chain(&cond.alternatives) {
                     self.resolve_expr(&branch.condition, scope);
-                    self.resolve_block(branch.block.as_ref(), scope);
+                    self.resolve_block(branch.block.as_ref());
                 }
 
                 if let Some(fallback) = &cond.fallback {
-                    self.resolve_block(fallback.as_ref(), scope);
+                    self.resolve_block(fallback.as_ref());
                 }
             }
             BaseExpr::FnCall(fcall) => {
@@ -632,39 +655,30 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
                 }
             }
             BaseExpr::Parenthesized(paren) => self.resolve_expr(paren, scope),
-            BaseExpr::Path(path) => {
-                let nrid = match self.resolve_path(path, scope) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.diagnostics.push(e);
-                        return;
-                    }
-                };
-
-                self.resolutions.table.insert(path.id(), nrid);
-            }
-            _ => (),
+            BaseExpr::Path(path) => match self.resolve_path(path, scope) {
+                Ok(id) => _ = self.out.resolutions.table.insert(path.id(), id),
+                Err(e) => self.diagnostics.push(e),
+            },
+            BaseExpr::Literal(_)
+            | BaseExpr::Continue
+            | BaseExpr::Break(None)
+            | BaseExpr::Return(None) => (),
         }
     }
 
-    fn resolve_block(&mut self, block: Node<&Block>, _scope: ScopeId) {
-        let subscope = self.subscopes.table[&block.id()];
+    fn resolve_block(&mut self, block: Node<&Block>) {
+        let subscope = self.subscope(block.id());
 
         for stmt in &block.stmts {
             match &stmt.item {
                 Stmt::Binding(bind) => {
-                    _ = self.arena.scopes[subscope].values.insert(
-                        bind.ident.item,
-                        self.nrt.table.push(SymbolInfo::new(SymbolKind::Variable(
-                            bind.is_mutable.is_some(),
-                        ))),
-                    );
-
                     if let Some(ty) = &bind.ty {
                         self.resolve_ty(ty, subscope);
                     }
 
+                    // resolve the value first, so that it cannot refer to the binding itself
                     self.resolve_expr(&bind.value, subscope);
+                    self.bind(subscope, bind.ident, bind.is_mutable.is_some());
                 }
                 Stmt::ExprSemi(expr) => self.resolve_expr(expr, subscope),
                 Stmt::Item(item) => self.resolve_item(item.as_ref(), subscope),
@@ -674,22 +688,5 @@ impl<'arena, 'nrt, 'sscopes, 'diag, 'res, 'ast>
         if let Some(tail) = &block.tail {
             self.resolve_expr(tail, subscope);
         }
-    }
-
-    fn resolve_include_crate(&mut self, include: Node<&parser::item::IncludeCrate>) {
-        if include.unresolved {
-            return;
-        }
-
-        let source_idx = self
-            .crate_table
-            .status_by_name(include.item.ident.item)
-            .unwrap()
-            .source_idx();
-
-        let ast = self.ast_table.by_src(source_idx);
-        let subscope = self.subscopes.table[&include.id()];
-
-        self.resolve_module(&ast, subscope);
     }
 }

@@ -1,0 +1,2 @@
+product A {}
+static X: A = ;

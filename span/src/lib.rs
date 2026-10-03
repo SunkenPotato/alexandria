@@ -2,8 +2,6 @@
 //!
 //! For actually representing the source itself, see the `source` crate.
 
-#![feature(type_changing_struct_update)]
-
 use derive_more::{Deref, DerefMut};
 
 const _ASSERT_USIZE_GREATER_THAN_U32: () = assert!(
@@ -13,7 +11,8 @@ const _ASSERT_USIZE_GREATER_THAN_U32: () = assert!(
 
 /// A source region.
 ///
-/// A [`Span`] is a reference to a region of source code. It does not actually contain the source code, but is rather a pointer to it.
+/// A [`Span`] is a reference to a region of source code, expressed in byte offsets.
+/// It does not actually contain the source code, but is rather a pointer to it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Span {
     start: u32,
@@ -53,36 +52,42 @@ impl Span {
 /// This dereferences to `T`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Deref, DerefMut)]
 pub struct Spanned<T> {
+    /// The wrapped item.
     #[deref]
     #[deref_mut]
     pub item: T,
+    /// The region of source the item was taken from.
     pub span: Span,
 }
 
 impl<T> Spanned<T> {
+    /// Wrap an item with a span.
     pub fn new(span: Span, item: T) -> Self {
         Self { item, span }
     }
 
+    /// Extend the span of this item. See [`Span::extend`].
     pub const fn extend(mut self, span: Span) -> Self {
         self.span = self.span.extend(span);
         self
     }
 
+    /// Map the inner item, keeping the span.
     pub fn map<F, U>(self, f: F) -> Spanned<U>
     where
         F: FnOnce(T) -> U,
     {
         Spanned {
             item: f(self.item),
-            ..self
+            span: self.span,
         }
     }
 
+    /// Convert a `&Spanned<T>` into a `Spanned<&T>`.
     pub fn as_ref(&self) -> Spanned<&T> {
         Spanned {
             item: &self.item,
-            ..*self
+            span: self.span,
         }
     }
 }

@@ -1,0 +1,2 @@
+include sub;
+static X: sub::A = 1;

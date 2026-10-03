@@ -1,6 +1,9 @@
 //! Information associated with a symbol.
 
-use crate::ScopeId;
+use source::SourceIdx;
+use span::Span;
+
+use crate::{Namespace, ScopeId};
 
 /// A symbol kind.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -20,17 +23,34 @@ pub enum SymbolKind {
     Module(ScopeId),
 }
 
+impl SymbolKind {
+    /// The namespace symbols of this kind live in.
+    pub const fn namespace(&self) -> Namespace {
+        match self {
+            Self::Variable(_) | Self::Function(_) => Namespace::Value,
+            Self::Type { .. } | Self::Module(_) => Namespace::Type,
+        }
+    }
+}
+
 /// Symbol info.
 #[derive(Clone, Copy, Debug)]
 pub struct SymbolInfo {
     kind: SymbolKind,
     used: bool,
+    span: Span,
+    source: SourceIdx,
 }
 
 impl SymbolInfo {
-    /// Create a new [`SymbolInfo`].
-    pub const fn new(kind: SymbolKind) -> Self {
-        Self { kind, used: false }
+    /// Create a new [`SymbolInfo`] for a symbol defined at `span` in `source`.
+    pub const fn new(kind: SymbolKind, span: Span, source: SourceIdx) -> Self {
+        Self {
+            kind,
+            used: false,
+            span,
+            source,
+        }
     }
 
     /// Mark this symbol as used.
@@ -46,6 +66,16 @@ impl SymbolInfo {
     /// Check whether this symbol has been marked as used.
     pub fn used(&self) -> bool {
         self.used
+    }
+
+    /// The span of the symbol's definition.
+    pub fn span(&self) -> Span {
+        self.span
+    }
+
+    /// The file the symbol is defined in.
+    pub fn source(&self) -> SourceIdx {
+        self.source
     }
 
     /// Check whether this symbol is projectable, and if so, return the scope ID.

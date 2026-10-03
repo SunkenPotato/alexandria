@@ -1,0 +1,3 @@
+include crate main;
+product T {}
+static V: T = 0;

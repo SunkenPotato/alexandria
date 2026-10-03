@@ -1,0 +1,2 @@
+product i {}
+static S: i = "é";

@@ -1,0 +1,6 @@
+product i {}
+static X: i = 1;
+static X: i = 2;
+//~ error: `X` is defined multiple times
+//~ note: see also tests/fixtures/fail/duplicate.aa:2:8
+//~ error: aborting due to 1 previous error

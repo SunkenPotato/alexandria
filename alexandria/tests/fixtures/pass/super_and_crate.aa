@@ -1,0 +1,12 @@
+product i {}
+
+module one {
+    pub product One { one: super::i }
+}
+
+module two {
+    import super::one::One;
+
+    static ONE: One = 5;
+    static TWO: crate::i = 2;
+}
