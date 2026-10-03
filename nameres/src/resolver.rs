@@ -371,6 +371,10 @@ impl Resolver<'_> {
                 self.register_expr(&binary.lhs, scope);
                 self.register_expr(&binary.rhs, scope);
             }
+            Expr::Assignment(assignment) => {
+                self.register_expr(&assignment.value, scope);
+                self.register_expr(&assignment.object, scope);
+            }
         }
     }
 
@@ -628,6 +632,10 @@ impl Resolver<'_> {
             Expr::Binary(bin) => {
                 self.resolve_expr(&bin.lhs, scope);
                 self.resolve_expr(&bin.rhs, scope);
+            }
+            Expr::Assignment(assignment) => {
+                self.resolve_expr(&assignment.value, scope);
+                self.resolve_expr(&assignment.object, scope);
             }
         }
     }

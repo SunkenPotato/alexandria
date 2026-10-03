@@ -16,11 +16,29 @@ pub enum Expr {
     Binary(BinaryExpr),
     /// A base expression.
     Base(BaseExpr),
+    /// An assignment expression.
+    Assignment(Assignment),
 }
 
 impl Parse for Expr {
-    fn parse<'source, 'index>(guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
-        Self::parse_1(guard, 0)
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        let base = guard.spanning(|guard| Self::parse_1(guard, 0))?;
+
+        if guard.peek_kind(TokenKind::Equal)
+            && guard
+                .peek_n(1)
+                .is_ok_and(|x| x.item.kind != TokenKind::Equal)
+        {
+            guard.next()?;
+            let value = Box::new(guard.spanning(Expr::parse)?);
+
+            Ok(Self::Assignment(Assignment {
+                object: Box::new(base),
+                value,
+            }))
+        } else {
+            Ok(base.item)
+        }
     }
 }
 
@@ -565,6 +583,16 @@ impl Parse for ConditionalBlock {
     }
 }
 
+/// An assignment of the form `$ident = $expr`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Assignment {
+    /// The identifier.
+    pub object: Box<Spanned<Expr>>,
+    /// The expression. Note: `x = y = 2` does not mean that `x` and `y` are both equal to `2`. It means that `x` will be equal
+    /// to the value of an assignment, which is always `nil` (`y` will be equal to `2`).
+    pub value: Box<Spanned<Expr>>,
+}
+
 // --- tests ---
 #[cfg(test)]
 mod tests {
@@ -575,7 +603,8 @@ mod tests {
     use crate::{
         assert_eq,
         expr::{
-            BaseExpr, BinaryExpr, BinaryOp, Block, ConditionalBlock, ConditionalExpr, Expr, FnCall,
+            Assignment, BaseExpr, BinaryExpr, BinaryOp, Block, ConditionalBlock, ConditionalExpr,
+            Expr, FnCall,
             literal::{IntegerLiteral, Literal, StringLiteral},
         },
         item::Type,
@@ -920,6 +949,89 @@ mod tests {
             ),
         )
     }
+
+    #[test]
+    fn parse_assignment() {
+        assert_eq(
+            "x = 5",
+            Spanned::new(
+                Span::new(0, 5),
+                Expr::Assignment(Assignment {
+                    object: Box::new(Spanned::new(
+                        Span::new(0, 1),
+                        Expr::Base(BaseExpr::Path(
+                            Path::single(Spanned::new(Span::new(0, 1), Intern::from("x"))).into(),
+                        )),
+                    )),
+                    value: Box::new(Spanned::new(
+                        Span::new(4, 5),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                    )),
+                }),
+            ),
+        )
+    }
+
+    // make sure that this doesn't trigger the assignment parser
+    #[test]
+    fn equality_is_not_assignment() {
+        assert_eq(
+            "x == 5",
+            Spanned::new(
+                Span::new(0, 6),
+                Expr::Binary(BinaryExpr {
+                    lhs: Box::new(Spanned::new(
+                        Span::new(0, 1),
+                        Expr::Base(BaseExpr::Path(
+                            Path::single(Spanned::new(Span::new(0, 1), Intern::from("x"))).into(),
+                        )),
+                    )),
+                    op: Spanned::new(Span::new(2, 4), BinaryOp::Eq),
+                    rhs: Box::new(Spanned::new(
+                        Span::new(5, 6),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                    )),
+                }),
+            ),
+        )
+    }
+
+    // ensure this doesn't parse as as a + (b = 5)
+    #[test]
+    fn binary_expr_with_assignment() {
+        assert_eq(
+            "a + b = 5",
+            Spanned::new(
+                Span::new(0, 9),
+                Expr::Assignment(Assignment {
+                    object: Box::new(Spanned::new(
+                        Span::new(0, 5),
+                        Expr::Binary(BinaryExpr {
+                            lhs: Box::new(Spanned::new(
+                                Span::new(0, 1),
+                                Expr::Base(BaseExpr::Path(
+                                    Path::single(Spanned::new(Span::new(0, 1), Intern::from("a")))
+                                        .into(),
+                                )),
+                            )),
+                            op: Spanned::new(Span::new(2, 3), BinaryOp::Add),
+                            rhs: Box::new(Spanned::new(
+                                Span::new(4, 5),
+                                Expr::Base(BaseExpr::Path(
+                                    Path::single(Spanned::new(Span::new(4, 5), Intern::from("b")))
+                                        .into(),
+                                )),
+                            )),
+                        }),
+                    )),
+                    value: Box::new(Spanned::new(
+                        Span::new(8, 9),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                    )),
+                }),
+            ),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -955,6 +1067,7 @@ mod regression_tests {
             Expr::Binary(b) => format!("({} {:?} {})", shape(&b.lhs), b.op.item, shape(&b.rhs)),
             Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(v)))) => v.to_string(),
             Expr::Base(other) => format!("{other:?}"),
+            Expr::Assignment(assignment) => format!("{assignment:?}"),
         }
     }
 
