@@ -171,3 +171,14 @@ fn lex_char_multi_codepoint() {
         )],
     )
 }
+
+#[test]
+fn lex_float() {
+    assert(
+        "0.0",
+        &[Spanned::new(
+            Span::new(0, 3),
+            Token::new(TokenKind::Float, "0.0"),
+        )],
+    )
+}

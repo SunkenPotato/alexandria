@@ -71,6 +71,8 @@ pub enum TokenKind {
     StringLit,
     /// A character literal.
     CharLit,
+    /// A float literal.
+    Float,
     /// An identifier.
     Ident,
 }
@@ -116,6 +118,7 @@ impl std::fmt::Display for TokenKind {
             Pipe => "`|`",
             CharLit => "character literal",
             Integer => "integer literal",
+            Float => "float literal",
             StringLit => "string literal",
             Ident => "identifier",
         };
@@ -215,8 +218,11 @@ impl<'s> Lexer<'s> {
                 '|' => Pipe,
                 '%' => Percent,
                 '0'..='9' => {
-                    self.lex_int();
-                    Integer
+                    if self.lex_number() {
+                        Float
+                    } else {
+                        Integer
+                    }
                 }
                 '"' => {
                     self.lex_str();
@@ -263,9 +269,25 @@ impl<'s> Lexer<'s> {
         ))
     }
 
-    fn lex_int(&mut self) {
+    /// Lex the next number. Returns whether the lexed number was a decimal or not.
+    fn lex_number(&mut self) -> bool {
+        self.lex_number_inner(true)
+    }
+
+    fn lex_number_inner(&mut self, lex_float: bool) -> bool {
         while let Some('0'..='9' | '_') = self.peek() {
             _ = self.next();
+        }
+
+        if lex_float
+            && let Some('.') = self.peek()
+            && let Some('0'..='9') = self.peek_two()
+        {
+            _ = self.next();
+            self.lex_number_inner(false);
+            true
+        } else {
+            false
         }
     }
 
@@ -383,6 +405,11 @@ impl<'s> Lexer<'s> {
     /// Peek the next character.
     fn peek(&self) -> Option<char> {
         self.iter.clone().next()
+    }
+
+    /// Peek two characters ahead.
+    fn peek_two(&self) -> Option<char> {
+        self.iter.clone().nth(1)
     }
 
     /// Commit the text consumed so far and create a new token from it.
