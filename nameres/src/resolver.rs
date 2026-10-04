@@ -43,12 +43,100 @@ impl SubscopeTable {
 /// A table mapping nodes to name resolution IDs.
 #[derive(Default, Debug)]
 pub struct ResolutionTable {
-    table: HashMap<NodeId, NameResId>,
+    table: HashMap<NodeId, Res>,
+}
+
+/// A resolution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Res {
+    /// A primitive type.
+    PrimTy(PrimTy),
+    /// A definition.
+    Def(NameResId),
+}
+
+impl Res {
+    /// Get the [`NameResId`] of this resolution, if it has one.
+    pub fn id(self) -> Option<NameResId> {
+        match self {
+            Self::Def(id) => Some(id),
+            Self::PrimTy(_) => None,
+        }
+    }
+}
+
+/// A primitive, internally-defined type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PrimTy {
+    /// The string slice. (`str`)
+    Str,
+    /// An unsigned integer corresponding to the architecture's pointer width. (`usize`)
+    Usize,
+    /// A signed integer corresponding to the architecture's pointer width. (`isize`)
+    Isize,
+    /// A signed integer with a width of 8 bits. (`i8`)
+    I8,
+    /// A signed integer with a width of 16 bits. (`i16`)
+    I16,
+    /// A signed integer with a width of 32 bits. (`i32`)
+    I32,
+    /// A signed integer with a width of 64 bits. (`i64`)
+    I64,
+    /// A signed integer with a width of 128 bits. (`i128`).
+    I128,
+    /// An unsigned integer with a width of 8 bits. (`u8`)
+    U8,
+    /// An unsigned integer with a width of 16 bits. (`u16`)
+    U16,
+    /// An unsigned integer with a width of 32 bits. (`u32`)
+    U32,
+    /// An unsigned integer with a width of 64 bits. (`u64`)
+    U64,
+    /// An unsigned integer with a width of 128 bits. (`u128`)
+    U128,
+    /// A floating-point precision number with a width of 32 bits. (`f32`)
+    F32,
+    /// A floating-point precision number with a width of 64 bits. (`f64`)
+    F64,
+    /// No value at all. (`nil`)
+    Nil,
+    /// A singular character. (`char`)
+    Char,
+    /// A value that will never exist. (`never`)
+    Never,
+}
+
+impl TryFrom<&'_ str> for PrimTy {
+    type Error = ();
+
+    fn try_from(value: &'_ str) -> Result<Self, Self::Error> {
+        Ok(match value {
+            "str" => Self::Str,
+            "usize" => Self::Usize,
+            "isize" => Self::Isize,
+            "i8" => Self::I8,
+            "i16" => Self::I16,
+            "i32" => Self::I32,
+            "i64" => Self::I64,
+            "i128" => Self::I128,
+            "u8" => Self::U8,
+            "u16" => Self::U16,
+            "u32" => Self::U32,
+            "u64" => Self::U64,
+            "u128" => Self::U128,
+            "f32" => Self::F32,
+            "f64" => Self::F64,
+            "nil" => Self::Nil,
+            "never" => Self::Never,
+            "char" => Self::Char,
+            _ => return Err(()),
+        })
+    }
 }
 
 impl ResolutionTable {
     /// Retrieve the symbol a node resolves to.
-    pub fn get(&self, node: NodeId) -> Option<NameResId> {
+    pub fn get(&self, node: NodeId) -> Option<Res> {
         self.table.get(&node).copied()
     }
 }
@@ -450,14 +538,15 @@ impl Resolver<'_> {
 
             for import in pending {
                 match self.resolve_path(&import.path, import.scope) {
-                    Ok(id) => {
+                    Ok(id) if let Some(id) = id.id() => {
                         let ns = self.out.nrt.table[id].kind().namespace();
                         let last = import.path.segments.last().unwrap();
                         let name = Spanned::new(last.span, last.as_intern_str());
 
                         self.insert_name(import.scope, ns, name, id);
-                        self.out.resolutions.table.insert(import.node, id);
+                        self.out.resolutions.table.insert(import.node, Res::Def(id));
                     }
+                    Ok(_prim) => (),
                     Err(e) => {
                         failed.push(import);
                         errors.push(e);
@@ -486,7 +575,17 @@ impl Resolver<'_> {
 /////////////////////////////////////////////////////
 
 impl Resolver<'_> {
-    fn resolve_path(&self, path: &Path, scope: ScopeId) -> Result<NameResId, Diagnostic> {
+    fn is_primitive(path: &Path) -> Option<PrimTy> {
+        (path.segments.len() == 1)
+            .then(|| PrimTy::try_from(&path.segments.first().unwrap().item as &str).ok())
+            .flatten()
+    }
+
+    fn resolve_path(&self, path: &Path, scope: ScopeId) -> Result<Res, Diagnostic> {
+        if let Some(r) = Resolver::is_primitive(path) {
+            return Ok(Res::PrimTy(r));
+        }
+
         let arena = &self.out.arena;
         let source_file = arena.lookup_root(scope);
         let error = |span, msg: String| Diagnostic::error(span, msg, None, source_file);
@@ -543,7 +642,7 @@ impl Resolver<'_> {
             prev = segment;
         }
 
-        last.map_err(|_| {
+        last.map(Res::Def).map_err(|_| {
             error(
                 prev.span,
                 format!("`{}` cannot be used on its own", &*prev.item),
@@ -684,7 +783,6 @@ impl Resolver<'_> {
                         self.resolve_ty(ty, subscope);
                     }
 
-                    // resolve the value first, so that it cannot refer to the binding itself
                     self.resolve_expr(&bind.value, subscope);
                     self.bind(subscope, bind.ident, bind.is_mutable.is_some());
                 }

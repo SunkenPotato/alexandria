@@ -69,6 +69,8 @@ pub enum TokenKind {
     Integer,
     /// A string literal.
     StringLit,
+    /// A character literal.
+    CharLit,
     /// An identifier.
     Ident,
 }
@@ -112,6 +114,7 @@ impl std::fmt::Display for TokenKind {
             LCurly => "`{`",
             RCurly => "`}`",
             Pipe => "`|`",
+            CharLit => "character literal",
             Integer => "integer literal",
             StringLit => "string literal",
             Ident => "identifier",
@@ -219,6 +222,10 @@ impl<'s> Lexer<'s> {
                     self.lex_str();
                     StringLit
                 }
+                '\'' => {
+                    self.lex_char();
+                    CharLit
+                }
                 'a'..='z' | 'A'..='Z' | '_' => {
                     self.lex_ident();
                     Ident
@@ -290,6 +297,52 @@ impl<'s> Lexer<'s> {
     fn lex_ident(&mut self) {
         while let Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_') = self.peek() {
             _ = self.next();
+        }
+    }
+
+    fn lex_char(&mut self) {
+        let mut ctr = 0;
+        let mut closed = false;
+
+        while let Some(next) = self.next() {
+            match next {
+                '\'' => {
+                    closed = true;
+                    break;
+                }
+                '\"' => {
+                    self.emit(
+                        DiagnosticLevel::Error,
+                        "character literals must be terminated with `'`, not `\"`",
+                        Some("replace the `'` with a `\"`".to_owned()),
+                    );
+                    break;
+                }
+                _ => (),
+            }
+            ctr += 1;
+        }
+
+        if ctr == 0 {
+            self.emit(
+                DiagnosticLevel::Error,
+                "character literals must not be empty",
+                None,
+            );
+        } else if ctr > 1 {
+            self.emit(
+                DiagnosticLevel::Error,
+                "character literals may only contain one grapheme",
+                None,
+            );
+        }
+
+        if !closed {
+            self.emit(
+                DiagnosticLevel::Error,
+                "character literals must be terminated by a `'`",
+                None,
+            );
         }
     }
 

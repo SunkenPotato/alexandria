@@ -149,3 +149,25 @@ fn lex_nested_block_comment() {
         ],
     );
 }
+
+#[test]
+fn lex_char() {
+    assert(
+        "'a'",
+        &[Spanned::new(
+            Span::new(0, 3),
+            Token::new(TokenKind::CharLit, "'a'"),
+        )],
+    )
+}
+
+#[test]
+fn lex_char_multi_codepoint() {
+    assert(
+        "'💛'",
+        &[Spanned::new(
+            Span::new(0, 6),
+            Token::new(TokenKind::CharLit, "'💛'"),
+        )],
+    )
+}

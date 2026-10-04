@@ -3,6 +3,9 @@
 pub mod resolver;
 pub mod sym_info;
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::HashMap;
 
 use index_vec::{self, IndexVec, define_index_type};

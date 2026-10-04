@@ -1,0 +1,2 @@
+static X: char = 'ab';
+//~ error: character literals may only contain one grapheme
