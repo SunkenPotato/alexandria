@@ -116,7 +116,7 @@ mod tests {
                     )),
                     value: Spanned::new(
                         Span::new(14, 15),
-                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5, None)))),
                     ),
                 }),
             ),
@@ -142,7 +142,7 @@ mod tests {
                     )),
                     value: Spanned::new(
                         Span::new(15, 16),
-                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5, None)))),
                     ),
                 }),
             ),

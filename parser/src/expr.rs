@@ -394,8 +394,8 @@ pub mod literal {
     /// An integer.
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub enum IntegerLiteral {
-        /// A successfull integer parse.
-        Ok(u128),
+        /// A successfull integer parse. This contains the integer as well as the type tag, if one was present.
+        Ok(u128, Option<Spanned<Intern<str>>>),
         /// The integer would have overflowed.
         Overflow,
     }
@@ -413,7 +413,12 @@ pub mod literal {
                 }
             };
 
-            Ok(Self::Ok(int.item))
+            let tag = guard
+                .next_require(TokenKind::Ident)
+                .map(|x| x.map(|x| x.symbol))
+                .ok();
+
+            Ok(Self::Ok(int.item, tag))
         }
     }
 
@@ -426,6 +431,8 @@ pub mod literal {
             integer: Spanned<u128>,
             /// The fractional part of this float (e.g., `456` in `123.456`).
             fractional: Spanned<u128>,
+            /// The type tag.
+            tag: Option<Spanned<Intern<str>>>,
         },
         /// The integer part of this float would have overflowed it's internal representation capacity.
         IntOverflow,
@@ -469,9 +476,15 @@ pub mod literal {
                 }
             };
 
+            let tag = guard
+                .next_require(TokenKind::Ident)
+                .map(|x| x.map(|x| x.symbol))
+                .ok();
+
             Ok(Self::Ok {
                 integer: parsed_int,
                 fractional: parsed_frac,
+                tag,
             })
         }
     }
@@ -690,7 +703,10 @@ mod tests {
     fn parse_int() {
         assert_eq(
             "123456789",
-            Spanned::new(Span::new(0, 9), Literal::Int(IntegerLiteral::Ok(123456789))),
+            Spanned::new(
+                Span::new(0, 9),
+                Literal::Int(IntegerLiteral::Ok(123456789, None)),
+            ),
         );
     }
 
@@ -703,6 +719,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_int_with_tag() {
+        assert_eq(
+            "3usize",
+            Spanned::new(
+                Span::new(0, 6),
+                Literal::Int(IntegerLiteral::Ok(
+                    3,
+                    Some(Spanned::new(Span::new(1, 6), Intern::from("usize"))),
+                )),
+            ),
+        )
+    }
+
+    #[test]
     fn parse_float() {
         assert_eq(
             "3.141",
@@ -711,6 +741,22 @@ mod tests {
                 Literal::Float(super::literal::FloatLiteral::Ok {
                     integer: Spanned::new(Span::new(0, 1), 3),
                     fractional: Spanned::new(Span::new(2, 5), 141),
+                    tag: None,
+                }),
+            ),
+        )
+    }
+
+    #[test]
+    fn parse_float_with_tag() {
+        assert_eq(
+            "3.1f64",
+            Spanned::new(
+                Span::new(0, 6),
+                Literal::Float(super::literal::FloatLiteral::Ok {
+                    integer: Spanned::new(Span::new(0, 1), 3),
+                    fractional: Spanned::new(Span::new(2, 3), 1),
+                    tag: Some(Spanned::new(Span::new(3, 6), Intern::from("f64"))),
                 }),
             ),
         )
@@ -757,12 +803,12 @@ mod tests {
                 Expr::Binary(BinaryExpr {
                     lhs: Box::new(Spanned::new(
                         Span::new(0, 1),
-                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2)))),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2, None)))),
                     )),
                     op: Spanned::new(Span::new(2, 3), BinaryOp::Add),
                     rhs: Box::new(Spanned::new(
                         Span::new(4, 5),
-                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2)))),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2, None)))),
                     )),
                 }),
             ),
@@ -781,7 +827,9 @@ mod tests {
                         Expr::Binary(BinaryExpr {
                             lhs: Box::new(Spanned::new(
                                 Span::new(0, 1),
-                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(4)))),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(
+                                    4, None,
+                                )))),
                             )),
                             op: Spanned::new(Span::new(2, 3), BinaryOp::Sub),
                             rhs: Box::new(Spanned::new(
@@ -790,14 +838,14 @@ mod tests {
                                     lhs: Box::new(Spanned::new(
                                         Span::new(4, 6),
                                         Expr::Base(BaseExpr::Literal(Literal::Int(
-                                            IntegerLiteral::Ok(11),
+                                            IntegerLiteral::Ok(11, None),
                                         ))),
                                     )),
                                     op: Spanned::new(Span::new(7, 8), BinaryOp::Rem),
                                     rhs: Box::new(Spanned::new(
                                         Span::new(9, 10),
                                         Expr::Base(BaseExpr::Literal(Literal::Int(
-                                            IntegerLiteral::Ok(7),
+                                            IntegerLiteral::Ok(7, None),
                                         ))),
                                     )),
                                 }),
@@ -810,12 +858,16 @@ mod tests {
                         Expr::Binary(BinaryExpr {
                             lhs: Box::new(Spanned::new(
                                 Span::new(14, 16),
-                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(16)))),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(
+                                    16, None,
+                                )))),
                             )),
                             op: Spanned::new(Span::new(17, 19), BinaryOp::Shr),
                             rhs: Box::new(Spanned::new(
                                 Span::new(20, 21),
-                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(4)))),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(
+                                    4, None,
+                                )))),
                             )),
                         }),
                     )),
@@ -852,7 +904,7 @@ mod tests {
                                 value: Spanned::new(
                                     Span::new(15, 16),
                                     Expr::Base(BaseExpr::Literal(Literal::Int(
-                                        IntegerLiteral::Ok(5),
+                                        IntegerLiteral::Ok(5, None),
                                     ))),
                                 ),
                             }),
@@ -896,7 +948,7 @@ mod tests {
             Spanned::new(
                 Span::new(0, 3),
                 Expr::Base(BaseExpr::Parenthesized(Box::new(Expr::Base(
-                    BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5))),
+                    BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5, None))),
                 )))),
             ),
         );
@@ -918,11 +970,15 @@ mod tests {
                     args: vec![
                         Spanned::new(
                             Span::new(4, 5),
-                            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2)))),
+                            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(
+                                2, None,
+                            )))),
                         ),
                         Spanned::new(
                             Span::new(7, 8),
-                            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(2)))),
+                            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(
+                                2, None,
+                            )))),
                         ),
                     ],
                 })),
@@ -942,7 +998,9 @@ mod tests {
                         ConditionalBlock {
                             condition: Box::new(Spanned::new(
                                 Span::new(4, 5),
-                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(1)))),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(
+                                    1, None,
+                                )))),
                             )),
                             block: Node::new(
                                 Span::new(7, 12),
@@ -951,7 +1009,7 @@ mod tests {
                                     tail: Some(Box::new(Spanned::new(
                                         Span::new(9, 10),
                                         Expr::Base(BaseExpr::Literal(Literal::Int(
-                                            IntegerLiteral::Ok(2),
+                                            IntegerLiteral::Ok(2, None),
                                         ))),
                                     ))),
                                 },
@@ -1026,7 +1084,7 @@ mod tests {
                 Span::new(0, 7),
                 Expr::Base(BaseExpr::Break(Some(Box::new(Spanned::new(
                     Span::new(6, 7),
-                    Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                    Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5, None)))),
                 ))))),
             ),
         )
@@ -1064,7 +1122,7 @@ mod tests {
                     )),
                     value: Box::new(Spanned::new(
                         Span::new(4, 5),
-                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5, None)))),
                     )),
                 }),
             ),
@@ -1088,7 +1146,7 @@ mod tests {
                     op: Spanned::new(Span::new(2, 4), BinaryOp::Eq),
                     rhs: Box::new(Spanned::new(
                         Span::new(5, 6),
-                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5, None)))),
                     )),
                 }),
             ),
@@ -1125,7 +1183,7 @@ mod tests {
                     )),
                     value: Box::new(Spanned::new(
                         Span::new(8, 9),
-                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5, None)))),
                     )),
                 }),
             ),
@@ -1152,7 +1210,7 @@ mod regression_tests {
     fn int(span: Span, v: u128) -> Box<Spanned<Expr>> {
         Box::new(Spanned::new(
             span,
-            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(v)))),
+            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(v, None)))),
         ))
     }
 
@@ -1164,7 +1222,9 @@ mod regression_tests {
     fn shape(expr: &Expr) -> String {
         match expr {
             Expr::Binary(b) => format!("({} {:?} {})", shape(&b.lhs), b.op.item, shape(&b.rhs)),
-            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(v)))) => v.to_string(),
+            Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(v, None)))) => {
+                v.to_string()
+            }
             Expr::Base(other) => format!("{other:?}"),
             Expr::Assignment(assignment) => format!("{assignment:?}"),
         }
@@ -1235,7 +1295,7 @@ mod regression_tests {
         assert_eq_custom_parser(
             Literal::parse,
             "1_000",
-            Literal::Int(IntegerLiteral::Ok(1000)),
+            Literal::Int(IntegerLiteral::Ok(1000, None)),
             None,
         );
     }
@@ -1313,7 +1373,7 @@ mod regression_tests {
                 ty: None,
                 value: Spanned::new(
                     Span::new(9, 10),
-                    Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5)))),
+                    Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5, None)))),
                 ),
             }),
             Some(Span::new(0, 11)),
