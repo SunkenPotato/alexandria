@@ -18,6 +18,8 @@ pub enum Expr {
     Base(BaseExpr),
     /// An assignment expression.
     Assignment(Assignment),
+    /// An expression with a unary operator.
+    Unary(UnaryExpr),
 }
 
 impl Parse for Expr {
@@ -43,8 +45,17 @@ impl Parse for Expr {
 }
 
 impl Expr {
+    fn parse_unary(mut guard: ParseGuard) -> ParseResult<Self> {
+        if let Ok(op) = guard.spanning(UnaryOp::parse) {
+            let object = Box::new(guard.spanning(Self::parse_unary)?);
+            Ok(Self::Unary(UnaryExpr { op, object }))
+        } else {
+            guard.with(BaseExpr::parse).map(Self::Base)
+        }
+    }
+
     fn parse_1(mut guard: ParseGuard, precedence: u8) -> ParseResult<Self> {
-        let mut base: Spanned<_> = guard.spanning(BaseExpr::parse)?.map(Self::Base);
+        let mut base: Spanned<_> = guard.spanning(Self::parse_unary)?;
 
         while let Ok(op) = guard.spanning(|guard| match BinaryOp::parse(guard) {
             Ok(v) if v.precedence() > precedence => Ok(v),
@@ -75,6 +86,8 @@ fn starts_expr(kind: TokenKind) -> bool {
             | TokenKind::StringLit
             | TokenKind::LCurly
             | TokenKind::Ident
+            | TokenKind::Bang
+            | TokenKind::Minus
     )
 }
 
@@ -680,6 +693,41 @@ pub struct Assignment {
     pub value: Box<Spanned<Expr>>,
 }
 
+/// A unary expression.
+#[derive(Clone, PartialEq, Debug)]
+pub struct UnaryExpr {
+    /// The unary operator.
+    pub op: Spanned<UnaryOp>,
+    /// The expression.
+    pub object: Box<Spanned<Expr>>,
+}
+
+/// A unary operator.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum UnaryOp {
+    /// `-`.
+    Neg,
+    /// `!`.
+    Not,
+}
+
+impl Parse for UnaryOp {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        let next = guard.next()?;
+
+        if next.kind == TokenKind::Bang {
+            Ok(Self::Not)
+        } else if next.kind == TokenKind::Minus {
+            Ok(Self::Neg)
+        } else {
+            Err(ParseError::TokenMismatch(
+                smallvec::smallvec![TokenKind::Bang, TokenKind::Minus],
+                next.span,
+            ))
+        }
+    }
+}
+
 // --- tests ---
 #[cfg(test)]
 mod tests {
@@ -1189,6 +1237,48 @@ mod tests {
             ),
         )
     }
+
+    #[test]
+    fn parse_unary_expr() {
+        assert_eq(
+            "-5",
+            Spanned::new(
+                Span::new(0, 2),
+                Expr::Unary(super::UnaryExpr {
+                    op: Spanned::new(Span::new(0, 1), super::UnaryOp::Neg),
+                    object: Box::new(Spanned::new(
+                        Span::new(1, 2),
+                        Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(5, None)))),
+                    )),
+                }),
+            ),
+        );
+    }
+
+    #[test]
+    fn parse_multi_op_unary_expr() {
+        assert_eq(
+            "-!5",
+            Spanned::new(
+                Span::new(0, 3),
+                Expr::Unary(super::UnaryExpr {
+                    op: Spanned::new(Span::new(0, 1), super::UnaryOp::Neg),
+                    object: Box::new(Spanned::new(
+                        Span::new(1, 3),
+                        Expr::Unary(super::UnaryExpr {
+                            op: Spanned::new(Span::new(1, 2), super::UnaryOp::Not),
+                            object: Box::new(Spanned::new(
+                                Span::new(2, 3),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(
+                                    5, None,
+                                )))),
+                            )),
+                        }),
+                    )),
+                }),
+            ),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1227,6 +1317,7 @@ mod regression_tests {
             }
             Expr::Base(other) => format!("{other:?}"),
             Expr::Assignment(assignment) => format!("{assignment:?}"),
+            Expr::Unary(other) => format!("{:?} {}", other.op.item, shape(&other.object)),
         }
     }
 

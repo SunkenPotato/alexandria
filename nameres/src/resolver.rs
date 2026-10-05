@@ -463,6 +463,7 @@ impl Resolver<'_> {
                 self.register_expr(&assignment.value, scope);
                 self.register_expr(&assignment.object, scope);
             }
+            Expr::Unary(unary) => self.register_expr(&unary.object, scope),
         }
     }
 
@@ -736,6 +737,7 @@ impl Resolver<'_> {
                 self.resolve_expr(&assignment.value, scope);
                 self.resolve_expr(&assignment.object, scope);
             }
+            Expr::Unary(unary) => self.resolve_expr(&unary.object, scope),
         }
     }
 
