@@ -334,7 +334,8 @@ fn parse_kw_with_expr(
 pub mod literal {
     use diagnostic::Diagnostic;
     use lexer::{Intern, TokenKind};
-    use span::Span;
+    use source::SourceIdx;
+    use span::{Span, Spanned};
 
     use crate::{Parse, ParseError};
 
@@ -343,6 +344,8 @@ pub mod literal {
     pub enum Literal {
         /// An integer.
         Int(IntegerLiteral),
+        /// A float.
+        Float(FloatLiteral),
         /// A string.
         Str(StringLiteral),
     }
@@ -353,6 +356,7 @@ pub mod literal {
         ) -> crate::ParseResult<Self> {
             let next = guard.peek()?;
             match next.item.kind {
+                TokenKind::Float => Ok(Self::Float(FloatLiteral::parse(guard)?)),
                 TokenKind::Integer => Ok(Self::Int(IntegerLiteral::parse(guard)?)),
                 TokenKind::StringLit => Ok(Self::Str(StringLiteral::parse(guard)?)),
                 _ => Err(ParseError::TokenMismatch(
@@ -361,6 +365,30 @@ pub mod literal {
                 )),
             }
         }
+    }
+
+    fn parse_integer(
+        input: Spanned<&str>,
+        source_idx: SourceIdx,
+    ) -> Result<Spanned<u128>, Diagnostic> {
+        let value = input
+            .chars()
+            .filter(|x| *x != '_')
+            .try_fold(0u128, |acc, digit| {
+                acc.checked_mul(10)?
+                    .checked_add(u128::from(digit.to_digit(10)?))
+            });
+
+        let Some(value) = value else {
+            return Err(Diagnostic::error(
+                input.span,
+                "integer literal overflow: integer literals have a maximum value of 2^128 - 1",
+                None,
+                source_idx,
+            ));
+        };
+
+        Ok(input.map(|_| value))
     }
 
     /// An integer.
@@ -376,29 +404,75 @@ pub mod literal {
         fn parse<'source, 'index>(
             mut guard: crate::ParseGuard<'source, 'index>,
         ) -> crate::ParseResult<Self> {
-            let next = guard.next_require(TokenKind::Integer)?;
-            let value =
-                next.item
-                    .symbol
-                    .chars()
-                    .filter(|x| *x != '_')
-                    .try_fold(0u128, |acc, digit| {
-                        acc.checked_mul(10)?
-                            .checked_add(u128::from(digit.to_digit(10)?))
-                    });
-
-            let Some(value) = value else {
-                guard.emit(Diagnostic::error(
-                    next.span,
-                    "integer literal overflow: integer literals have a maximum value of 2^128 - 1",
-                    None,
-                    guard.source_idx,
-                ));
-
-                return Ok(Self::Overflow);
+            let token = guard.next_require(TokenKind::Integer)?;
+            let int = match parse_integer(token.map(|_| &token.symbol as &str), guard.source_idx) {
+                Ok(v) => v,
+                Err(e) => {
+                    guard.emit(e);
+                    return Ok(Self::Overflow);
+                }
             };
 
-            Ok(Self::Ok(value))
+            Ok(Self::Ok(int.item))
+        }
+    }
+
+    /// A float literal.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum FloatLiteral {
+        /// A successful float parse.
+        Ok {
+            /// The integer part of this float (e.g., `123` in `123.456`).
+            integer: Spanned<u128>,
+            /// The fractional part of this float (e.g., `456` in `123.456`).
+            fractional: Spanned<u128>,
+        },
+        /// The integer part of this float would have overflowed it's internal representation capacity.
+        IntOverflow,
+        /// The fraction part of this float would have overflowed it's internal representation capacity.
+        FracOverflow,
+    }
+
+    impl Parse for FloatLiteral {
+        fn parse<'source, 'index>(
+            mut guard: crate::ParseGuard<'source, 'index>,
+        ) -> crate::ParseResult<Self> {
+            let token = guard.next_require(TokenKind::Float)?;
+            let (int, frac) = token.symbol.split_once('.').unwrap();
+            let parsed_int = match parse_integer(
+                Spanned::new(
+                    Span::new(token.span.start(), token.span.start() + int.len() as u32),
+                    int,
+                ),
+                guard.source_idx,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    guard.emit(e);
+                    return Ok(Self::IntOverflow);
+                }
+            };
+            let parsed_frac = match parse_integer(
+                Spanned::new(
+                    Span::new(
+                        parsed_int.span.stop() + 1,
+                        parsed_int.span.stop() + 1 + frac.len() as u32,
+                    ),
+                    frac,
+                ),
+                guard.source_idx,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    guard.emit(e);
+                    return Ok(Self::FracOverflow);
+                }
+            };
+
+            Ok(Self::Ok {
+                integer: parsed_int,
+                fractional: parsed_frac,
+            })
         }
     }
 
@@ -626,6 +700,31 @@ mod tests {
             "340282366920938463463374607431768211456",
             Spanned::new(Span::new(0, 39), Literal::Int(IntegerLiteral::Overflow)),
         );
+    }
+
+    #[test]
+    fn parse_float() {
+        assert_eq(
+            "3.141",
+            Spanned::new(
+                Span::new(0, 5),
+                Literal::Float(super::literal::FloatLiteral::Ok {
+                    integer: Spanned::new(Span::new(0, 1), 3),
+                    fractional: Spanned::new(Span::new(2, 5), 141),
+                }),
+            ),
+        )
+    }
+
+    #[test]
+    fn parse_float_frac_overflow() {
+        assert_eq(
+            "1.340282366920938463463374607431768211456",
+            Spanned::new(
+                Span::new(0, 41),
+                Literal::Float(super::literal::FloatLiteral::FracOverflow),
+            ),
+        )
     }
 
     #[test]
