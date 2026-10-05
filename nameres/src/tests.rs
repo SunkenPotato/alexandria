@@ -199,6 +199,7 @@ fn collect_expr<'a>(expr: &'a Expr, out: &mut Vec<&'a Node<Path>>) {
             collect_expr(&assignment.value, out);
         }
         Expr::Unary(unary) => collect_expr(&unary.object, out),
+        Expr::FieldAccess(acc) => collect_expr(&acc.object, out),
     }
 }
 

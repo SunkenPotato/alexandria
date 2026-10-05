@@ -20,11 +20,13 @@ pub enum Expr {
     Assignment(Assignment),
     /// An expression with a unary operator.
     Unary(UnaryExpr),
+    /// A field access.
+    FieldAccess(FieldAccess),
 }
 
 impl Parse for Expr {
     fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
-        let base = guard.spanning(|guard| Self::parse_1(guard, 0))?;
+        let mut base = guard.spanning(|guard| Self::parse_1(guard, 0))?;
 
         if guard.peek_kind(TokenKind::Equal)
             && guard
@@ -34,13 +36,31 @@ impl Parse for Expr {
             guard.next()?;
             let value = Box::new(guard.spanning(Expr::parse)?);
 
-            Ok(Self::Assignment(Assignment {
-                object: Box::new(base),
-                value,
-            }))
-        } else {
-            Ok(base.item)
+            base = Spanned::new(
+                base.span.extend(value.span),
+                Self::Assignment(Assignment {
+                    object: Box::new(base),
+                    value,
+                }),
+            );
         }
+
+        loop {
+            if guard.next_require(TokenKind::Dot).is_ok() {
+                let ident = guard.next_require(TokenKind::Ident)?.map(|x| x.symbol);
+                base = Spanned::new(
+                    base.span.extend(ident.span),
+                    Expr::FieldAccess(FieldAccess {
+                        object: Box::new(base),
+                        ident,
+                    }),
+                );
+            } else {
+                break;
+            }
+        }
+
+        Ok(base.item)
     }
 }
 
@@ -728,6 +748,17 @@ impl Parse for UnaryOp {
     }
 }
 
+/// A field access, like `a.b`.
+///
+/// This is additionally used for method calls.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldAccess {
+    /// The object.
+    pub object: Box<Spanned<Expr>>,
+    /// The field to access.
+    pub ident: Spanned<Intern<str>>,
+}
+
 // --- tests ---
 #[cfg(test)]
 mod tests {
@@ -1279,6 +1310,51 @@ mod tests {
             ),
         )
     }
+
+    #[test]
+    fn parse_field_access() {
+        assert_eq(
+            "a.b",
+            Spanned::new(
+                Span::new(0, 3),
+                Expr::FieldAccess(super::FieldAccess {
+                    object: Box::new(Spanned::new(
+                        Span::new(0, 1),
+                        Expr::Base(BaseExpr::Path(
+                            Path::single(Spanned::new(Span::new(0, 1), Intern::from("a"))).into(),
+                        )),
+                    )),
+                    ident: Spanned::new(Span::new(2, 3), Intern::from("b")),
+                }),
+            ),
+        );
+    }
+
+    #[test]
+    fn parse_nested_field_access() {
+        assert_eq(
+            "a.b.c",
+            Spanned::new(
+                Span::new(0, 5),
+                Expr::FieldAccess(super::FieldAccess {
+                    object: Box::new(Spanned::new(
+                        Span::new(0, 3),
+                        Expr::FieldAccess(super::FieldAccess {
+                            object: Box::new(Spanned::new(
+                                Span::new(0, 1),
+                                Expr::Base(BaseExpr::Path(
+                                    Path::single(Spanned::new(Span::new(0, 1), Intern::from("a")))
+                                        .into(),
+                                )),
+                            )),
+                            ident: Spanned::new(Span::new(2, 3), Intern::from("b")),
+                        }),
+                    )),
+                    ident: Spanned::new(Span::new(4, 5), Intern::from("c")),
+                }),
+            ),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1318,6 +1394,7 @@ mod regression_tests {
             Expr::Base(other) => format!("{other:?}"),
             Expr::Assignment(assignment) => format!("{assignment:?}"),
             Expr::Unary(other) => format!("{:?} {}", other.op.item, shape(&other.object)),
+            Expr::FieldAccess(other) => format!("{:?}.{}", other.object.item, other.ident.item),
         }
     }
 

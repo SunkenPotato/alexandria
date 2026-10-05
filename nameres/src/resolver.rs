@@ -464,6 +464,7 @@ impl Resolver<'_> {
                 self.register_expr(&assignment.object, scope);
             }
             Expr::Unary(unary) => self.register_expr(&unary.object, scope),
+            Expr::FieldAccess(acc) => self.register_expr(&acc.object, scope),
         }
     }
 
@@ -738,6 +739,7 @@ impl Resolver<'_> {
                 self.resolve_expr(&assignment.object, scope);
             }
             Expr::Unary(unary) => self.resolve_expr(&unary.object, scope),
+            Expr::FieldAccess(acc) => self.resolve_expr(&acc.object, scope),
         }
     }
 
