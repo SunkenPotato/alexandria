@@ -6,8 +6,8 @@ use node::Node;
 use span::Spanned;
 
 use crate::{
-    CONST, CRATE, FUNC, IMPORT, INCLUDE, MODULE, PRODUCT, PUBLIC, Parse, ParseError, ParseGuard,
-    ParseResult, STATIC, SUM,
+    CONST, CRATE, FUNC, IMPORT, INCLUDE, MODULE, ON, PRODUCT, PUBLIC, Parse, ParseError,
+    ParseGuard, ParseResult, STATIC, SUM,
     crate_table::CrateId,
     expr::{Block, Expr},
     path::Path,
@@ -60,6 +60,8 @@ pub enum Item {
     Include(IncludeDef),
     /// An include crate definition.
     IncludeCrate(IncludeCrate),
+    /// An implementation block.
+    OnBlock(OnBlock),
 }
 
 impl Item {
@@ -67,7 +69,7 @@ impl Item {
     pub(crate) fn starts_item(guard: &ParseGuard) -> bool {
         let offset = usize::from(guard.peek_kw(*PUBLIC));
         [
-            *FUNC, *MODULE, *CONST, *STATIC, *PRODUCT, *SUM, *IMPORT, *INCLUDE,
+            *FUNC, *MODULE, *CONST, *STATIC, *PRODUCT, *SUM, *IMPORT, *INCLUDE, *ON,
         ]
         .into_iter()
         .any(|kw| guard.peek_n_kw(offset, kw))
@@ -109,12 +111,14 @@ impl Item {
             guard.with(SumDef::parse).map(Self::SumDef)
         } else if is(*IMPORT) {
             guard.with(Import::parse).map(Self::Import)
+        } else if is(*ON) {
+            guard.with(OnBlock::parse).map(Self::OnBlock)
         } else if is(*INCLUDE) && guard.peek_n_kw(offset + 1, *CRATE) {
             guard.with(IncludeCrate::parse).map(Self::IncludeCrate)
         } else if is(*INCLUDE) {
             guard.with(IncludeDef::parse).map(Self::Include)
         } else {
-            Err(ParseError::ExpectedItem(token.span))
+            Err(ParseError::ExpectedItem(token.span, false))
         }
     }
 }
@@ -518,6 +522,77 @@ impl Parse for IncludeCrate {
     }
 }
 
+/// A block which is allowed to be in an `on` block.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OnBlockItem {
+    /// A function definition.
+    FnDef(FnDef),
+    /// A constant. This is guaranteed to be a constant.
+    Const(GlobalDef),
+}
+
+impl Parse for OnBlockItem {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        let offset = usize::from(guard.peek_kw(*PUBLIC));
+
+        if guard.peek_n_kw(offset, *CONST) {
+            Ok(Self::Const(
+                guard.with(GlobalDef::parser(GlobalDefKind::Const))?,
+            ))
+        } else if guard.peek_n_kw(offset, *FUNC) {
+            Ok(Self::FnDef(guard.with(FnDef::parse)?))
+        } else {
+            Err(ParseError::ExpectedItem(guard.peek()?.span, true))
+        }
+    }
+}
+
+/// An implementation block on a type.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OnBlock {
+    /// The generics, if any.
+    pub generics: Generics<Intern<str>>,
+    /// The type to implement on.
+    pub ty: Spanned<Type>,
+    /// The protocol to implement, if any.
+    pub protocol: Option<Spanned<Type>>,
+    /// The items.
+    pub items: Vec<Node<OnBlockItem>>,
+}
+
+impl Parse for OnBlock {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        guard.expect_kw(*ON)?;
+        let generics = parse_def_generics(&mut guard)?;
+        let ty = guard.spanning(Type::parse)?;
+
+        let protocol;
+
+        if guard.next_require(TokenKind::LParen).is_ok() {
+            protocol = Some(guard.spanning(Type::parse)?);
+            guard.next_require(TokenKind::RParen)?;
+        } else {
+            protocol = None;
+        }
+
+        guard.next_require(TokenKind::LCurly)?;
+        let mut items = vec![];
+
+        while guard.peek().is_ok_and(|x| x.item.kind != TokenKind::RCurly) {
+            items.push(guard.spanning(OnBlockItem::parse)?.into());
+        }
+
+        guard.next_require(TokenKind::RCurly)?;
+
+        Ok(Self {
+            generics,
+            ty,
+            protocol,
+            items,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use span::Span;
@@ -528,11 +603,23 @@ mod tests {
             BaseExpr, BinaryExpr, BinaryOp, Expr, FnCall,
             literal::{IntegerLiteral, Literal, StringLiteral},
         },
+        parse_err,
         path::Segment,
         stmt::Stmt,
     };
 
     use super::*;
+
+    /// A type consisting of a single path segment and no generics.
+    fn simple_ty(span: Span, name: &str) -> Spanned<Type> {
+        Spanned::new(
+            span,
+            Type {
+                path: Path::single(Spanned::new(span, Intern::from(name))).into(),
+                generics: None,
+            },
+        )
+    }
 
     #[test]
     fn parse_type() {
@@ -875,5 +962,145 @@ mod tests {
             )),
             None,
         )
+    }
+
+    #[test]
+    fn parse_on_block_empty() {
+        assert_eq(
+            "on Point {}",
+            Spanned::new(
+                Span::new(0, 11),
+                OnBlock {
+                    generics: None,
+                    ty: simple_ty(Span::new(3, 8), "Point"),
+                    protocol: None,
+                    items: vec![],
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn parse_on_block_generics_and_protocol() {
+        assert_eq(
+            "on[T] Vec[T] (Clone) {}",
+            Spanned::new(
+                Span::new(0, 23),
+                OnBlock {
+                    generics: Some(Spanned::new(
+                        Span::new(2, 5),
+                        vec![Spanned::new(Span::new(3, 4), Intern::from("T"))],
+                    )),
+                    ty: Spanned::new(
+                        Span::new(6, 12),
+                        Type {
+                            path: Path::single(Spanned::new(Span::new(6, 9), Intern::from("Vec")))
+                                .into(),
+                            generics: Some(Spanned::new(
+                                Span::new(9, 12),
+                                vec![simple_ty(Span::new(10, 11), "T")],
+                            )),
+                        },
+                    ),
+                    protocol: Some(simple_ty(Span::new(14, 19), "Clone")),
+                    items: vec![],
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn parse_on_block_items() {
+        assert_eq(
+            "on Point { pub func x {}: u32 { 0 } const ORIGIN: u32 = 0; }",
+            Spanned::new(
+                Span::new(0, 60),
+                OnBlock {
+                    generics: None,
+                    ty: simple_ty(Span::new(3, 8), "Point"),
+                    protocol: None,
+                    items: vec![
+                        Spanned::new(
+                            Span::new(11, 35),
+                            OnBlockItem::FnDef(FnDef {
+                                vis: Spanned::new(Span::new(11, 14), Visibility::Public),
+                                ident: Spanned::new(Span::new(20, 21), Intern::from("x")),
+                                generics: None,
+                                args: vec![],
+                                ret_ty: Some(simple_ty(Span::new(26, 29), "u32")),
+                                block: Node::new(
+                                    Span::new(30, 35),
+                                    Block {
+                                        stmts: vec![],
+                                        tail: Some(Box::new(Spanned::new(
+                                            Span::new(32, 33),
+                                            Expr::Base(BaseExpr::Literal(Literal::Int(
+                                                IntegerLiteral::Ok(0, None),
+                                            ))),
+                                        ))),
+                                    },
+                                ),
+                            }),
+                        )
+                        .into(),
+                        Spanned::new(
+                            Span::new(36, 58),
+                            OnBlockItem::Const(GlobalDef {
+                                vis: Spanned::new(Span::new(36, 36), Visibility::Private),
+                                kind: GlobalDefKind::Const,
+                                ident: Spanned::new(Span::new(42, 48), Intern::from("ORIGIN")),
+                                ty: simple_ty(Span::new(50, 53), "u32"),
+                                value: Spanned::new(
+                                    Span::new(56, 57),
+                                    Expr::Base(BaseExpr::Literal(Literal::Int(
+                                        IntegerLiteral::Ok(0, None),
+                                    ))),
+                                ),
+                            }),
+                        )
+                        .into(),
+                    ],
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn on_block_rejects_static() {
+        let (err, rendered) = parse_err(OnBlock::parse, "on Point { static X: u32 = 0; }");
+        assert!(
+            matches!(err, ParseError::ExpectedItem(span, true) if span == Span::new(11, 17)),
+            "{err:?}"
+        );
+        assert_eq!(rendered[0], "error: expected an item (`func` or `const`)");
+    }
+
+    #[test]
+    fn on_block_is_an_item() {
+        assert!(matches!(
+            parse_err(Item::parse, "on Point { static X: u32 = 0; }").0,
+            ParseError::ExpectedItem(_, true)
+        ));
+
+        let (_, rendered) = parse_err(Item::parse, "x");
+        assert!(
+            rendered[0].ends_with("`import`, `include` or `on`)"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn on_block_unclosed_protocol() {
+        let (err, _) = parse_err(OnBlock::parse, "on Point (Clone {}");
+        assert!(
+            matches!(err, ParseError::TokenMismatch(_, span) if span == Span::new(16, 17)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn on_block_missing_rcurly() {
+        let (err, _) = parse_err(OnBlock::parse, "on Point {");
+        assert!(matches!(err, ParseError::Eof(..)), "{err:?}");
     }
 }

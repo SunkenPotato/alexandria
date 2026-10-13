@@ -51,6 +51,11 @@ pub enum ScopeKind {
     Item,
     /// A block.
     Block,
+    /// The associated items of a type (defined in `on` blocks).
+    ///
+    /// Unlike every other kind, this is only a container: it is reachable through paths
+    /// (`Type::item`), but no code is resolved inside of it. It therefore has no parent.
+    Assoc,
 }
 
 impl ScopeKind {
@@ -164,6 +169,11 @@ impl ScopeArena {
             scope = parent;
         }
 
+        debug_assert_eq!(
+            self.scopes[scope].kind,
+            ScopeKind::CrateRoot,
+            "logic violation: scope outside of a crate"
+        );
         scope
     }
 

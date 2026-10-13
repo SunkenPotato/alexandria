@@ -8,7 +8,7 @@ use parser::{
     ast_table::AstTable,
     crate_table::CrateTable,
     expr::{BaseExpr, Block, Expr},
-    item::{Item, ProductDef, SumDef, Type},
+    item::{FnDef, Item, OnBlockItem, ProductDef, SumDef, Type},
     path::Path,
     stmt::Stmt,
 };
@@ -140,25 +140,42 @@ fn collect_item<'a>(item: &'a Node<Item>, out: &mut Vec<&'a Node<Path>>) {
             collect_ty(&def.ty, out);
             collect_expr(&def.value, out);
         }
-        Item::FnDef(def) => {
-            for arg in &def.args {
-                collect_ty(&arg.ty, out);
-            }
-            if let Some(ret) = &def.ret_ty {
-                collect_ty(ret, out);
-            }
-            collect_block(&def.block, out);
-        }
+        Item::FnDef(def) => collect_fn_def(def, out),
         Item::Module(module) => collect_items(&module.module.items, out),
         Item::ProductDef(ProductDef { fields, .. }) | Item::SumDef(SumDef { fields, .. }) => {
             for field in fields {
                 collect_ty(&field.ty, out);
             }
         }
+        Item::OnBlock(block) => {
+            collect_ty(&block.ty, out);
+            if let Some(protocol) = &block.protocol {
+                collect_ty(protocol, out);
+            }
+            for item in &block.items {
+                match &item.item {
+                    OnBlockItem::Const(def) => {
+                        collect_ty(&def.ty, out);
+                        collect_expr(&def.value, out);
+                    }
+                    OnBlockItem::FnDef(def) => collect_fn_def(def, out),
+                }
+            }
+        }
         // imports are resolved, but their path node isn't recorded in the resolution table
         // (the import item is), and included files live outside of this AST
         Item::Import(_) | Item::Include(_) | Item::IncludeCrate(_) => (),
     }
+}
+
+fn collect_fn_def<'a>(def: &'a FnDef, out: &mut Vec<&'a Node<Path>>) {
+    for arg in &def.args {
+        collect_ty(&arg.ty, out);
+    }
+    if let Some(ret) = &def.ret_ty {
+        collect_ty(ret, out);
+    }
+    collect_block(&def.block, out);
 }
 
 fn collect_ty<'a>(ty: &'a Type, out: &mut Vec<&'a Node<Path>>) {
@@ -249,7 +266,7 @@ fn registers_items() {
         lookup(out, "P").unwrap().kind(),
         SymbolKind::Type {
             generics: 1,
-            subscope: Some(_)
+            assoc: Some(_)
         }
     ));
     assert_eq!(lookup(out, "f").unwrap().kind(), &SymbolKind::Function(2));
@@ -330,5 +347,171 @@ static T: m::A = 1;",
             "crate::i@72 -> i@8",
             "m::A@98 -> A@40",
         ]
+    );
+}
+
+#[test]
+fn generics_are_not_projectable() {
+    let r = resolve("product P[T] {} static S: P::T = 1;");
+    assert!(r.out.is_err());
+    assert!(
+        r.errors().contains("`T` does not exist in `P`"),
+        "{}",
+        r.errors()
+    );
+}
+
+/////////////////////////////////////////////////////
+// ON BLOCKS                                       //
+/////////////////////////////////////////////////////
+
+#[test]
+fn on_block_items_are_associated() {
+    let r = resolve(
+        "product Point {}
+         on Point { func origin {} {} const ZERO: u32 = 0; }",
+    );
+    let out = r.ok();
+
+    assert_eq!(
+        lookup(out, "Point::origin").unwrap().kind(),
+        &SymbolKind::Function(0)
+    );
+    assert_eq!(
+        lookup(out, "Point::ZERO").unwrap().kind(),
+        &SymbolKind::Variable(false)
+    );
+    assert!(lookup(out, "origin").is_none());
+    assert!(lookup(out, "ZERO").is_none());
+}
+
+#[test]
+fn on_block_items_are_not_free() {
+    let r = resolve("product P {} on P { func f {} {} } func main {} { f() }");
+    assert!(r.out.is_err());
+    assert!(
+        r.errors().contains("could not find `f` in scope"),
+        "{}",
+        r.errors()
+    );
+}
+
+#[test]
+fn on_block_paths() {
+    let r = resolve("product P {} on P { func f {} {} } func main {} { P::f() }");
+    assert_eq!(r.uses(), ["P@16 -> P@8", "P::f@50 -> f@25"]);
+}
+
+#[test]
+fn same_item_on_two_types() {
+    let r = resolve("product A {} product B {} on A { func f {} {} } on B { func f {} {} }");
+    let out = r.ok();
+    assert_ne!(
+        lookup(out, "A::f").unwrap().span(),
+        lookup(out, "B::f").unwrap().span()
+    );
+}
+
+#[test]
+fn duplicate_item_across_on_blocks() {
+    let r = resolve("product A {} on A { func f {} {} } on A { func f {} {} }");
+    assert!(r.out.is_err());
+    assert!(
+        r.errors().contains("`f` is defined multiple times"),
+        "{}",
+        r.errors()
+    );
+}
+
+#[test]
+fn on_block_generics() {
+    let r = resolve("product V[T] {} on[T] V[T] { func get { v: T }: T { v } }");
+    assert_eq!(
+        r.uses(),
+        [
+            "V@22 -> V@8",
+            "T@24 -> T@19",
+            "T@43 -> T@19",
+            "T@48 -> T@19",
+            "v@52 -> v@40",
+        ]
+    );
+}
+
+#[test]
+fn on_block_body_is_lexically_in_its_module() {
+    // the body sees the module the block is written in, not the module of the type
+    let r = resolve(
+        "module a { pub product P {} func helper {} {} }
+         func g {} {}
+         on a::P { func f {} { g() } }",
+    );
+    let out = r.ok();
+    assert!(lookup(out, "a::P::f").is_some());
+
+    let r = resolve(
+        "module a { pub product P {} func helper {} {} }
+         on a::P { func f {} { helper() } }",
+    );
+    assert!(
+        r.errors().contains("could not find `helper` in scope"),
+        "{}",
+        r.errors()
+    );
+}
+
+#[test]
+fn on_block_at_root_keeps_crate_paths() {
+    // used to make the crate root a child of the type, so that `crate::` never terminated
+    let r = resolve("product P {} on P { func f {} { crate::g() } } func g {} {}");
+    assert_eq!(r.uses(), ["P@16 -> P@8", "crate::g@32 -> g@52"]);
+}
+
+#[test]
+fn on_block_inside_fn() {
+    let r = resolve("func main {} { decl x = 1; product P {} on P { func f {} {} } P::f(); x }");
+    let out = r.ok();
+    assert!(lookup(out, "main").is_some());
+    assert_eq!(
+        r.uses(),
+        ["P@43 -> P@35", "P::f@62 -> f@52", "x@70 -> x@20"]
+    );
+}
+
+#[test]
+fn on_block_on_non_type() {
+    for input in [
+        "func foo {} {} on foo {}",
+        "on[T] T {}",
+        "module m {} on m {}",
+    ] {
+        let r = resolve(input);
+        assert!(r.out.is_err(), "{input}");
+        assert!(
+            r.errors().contains("is not a type that can have items"),
+            "{}",
+            r.errors()
+        );
+    }
+}
+
+#[test]
+fn on_block_on_primitive() {
+    let r = resolve("on u32 { const MAX: u32 = 1; } static S: u32 = u32::MAX;");
+    assert_eq!(
+        r.uses(),
+        [
+            "u32@3 -> prim U32",
+            "u32@20 -> prim U32",
+            "u32@41 -> prim U32",
+            "u32::MAX@47 -> MAX@15",
+        ]
+    );
+
+    let r = resolve("static S: u32 = u32::MAX;");
+    assert!(
+        r.errors().contains("`MAX` does not exist in `u32`"),
+        "{}",
+        r.errors()
     );
 }

@@ -12,12 +12,15 @@ pub enum SymbolKind {
     Variable(bool),
     /// Function + arity.
     Function(usize),
-    /// Type, the scope it defines (if it has one, generics don't), and the # of generics.
+    /// Type, the # of generics, and the container of its associated items.
     Type {
         /// The # of generics this type carries.
         generics: usize,
-        /// Whether it defines a subscope.
-        subscope: Option<ScopeId>,
+        /// The container of the associated items (a [`ScopeKind::Assoc`] scope). Generic
+        /// parameters don't have one.
+        ///
+        /// [`ScopeKind::Assoc`]: crate::ScopeKind::Assoc
+        assoc: Option<ScopeId>,
     },
     /// Module and the scope it defines.
     Module(ScopeId),
@@ -78,11 +81,12 @@ impl SymbolInfo {
         self.source
     }
 
-    /// Check whether this symbol is projectable, and if so, return the scope ID.
+    /// Check whether this symbol is projectable, and if so, return the container that paths
+    /// project into (a module's scope, or a type's associated items).
     pub const fn projectable(&self) -> Option<ScopeId> {
         match self.kind {
             SymbolKind::Module(id) => Some(id),
-            SymbolKind::Type { subscope, .. } => subscope,
+            SymbolKind::Type { assoc, .. } => assoc,
             _ => None,
         }
     }

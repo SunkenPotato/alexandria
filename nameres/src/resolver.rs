@@ -15,7 +15,7 @@ use parser::{
     expr::{BaseExpr, Block, Expr},
     item::{
         FnDef, GlobalDef, GlobalDefKind, IncludeCrate, IncludeDef, InlineModule, Item, Module,
-        ProductDef, SumDef, Type,
+        OnBlock, OnBlockItem, ProductDef, SumDef, Type,
     },
     path::Path,
     stmt::Stmt,
@@ -66,7 +66,7 @@ impl Res {
 }
 
 /// A primitive, internally-defined type.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrimTy {
     /// The string slice. (`str`)
     Str,
@@ -152,6 +152,9 @@ pub struct NameResOutput {
     pub subscopes: SubscopeTable,
     /// The symbols paths resolve to.
     pub resolutions: ResolutionTable,
+    /// The associated items of primitive types. A primitive only has an entry once an `on`
+    /// block was written for it.
+    pub prim_assoc: HashMap<PrimTy, ScopeId>,
 }
 
 /// An import that has not been resolved yet.
@@ -159,6 +162,16 @@ struct PendingImport {
     path: Path,
     scope: ScopeId,
     node: NodeId,
+}
+
+/// An `on` block whose items have not been attached to their type yet.
+struct PendingOnBlock {
+    /// The type the block is implemented on.
+    ty: Spanned<Path>,
+    /// The lexical scope of the block (holding its generics).
+    scope: ScopeId,
+    /// The items of the block. These are declared, but not inserted into any scope yet.
+    items: Vec<(Spanned<Intern<str>>, NameResId)>,
 }
 
 /// The name resolver.
@@ -172,7 +185,8 @@ pub struct Resolver<'ast> {
     crate_scopes: HashMap<CrateId, ScopeId>,
     /// The crates whose items have been resolved.
     resolved_crates: HashSet<CrateId>,
-    imports: Vec<PendingImport>,
+    pending_imports: Vec<PendingImport>,
+    pending_on_blocks: Vec<PendingOnBlock>,
 }
 
 /// A resolution error.
@@ -200,7 +214,8 @@ impl<'ast> Resolver<'ast> {
             entry,
             crate_scopes: HashMap::new(),
             resolved_crates: HashSet::new(),
-            imports: vec![],
+            pending_imports: vec![],
+            pending_on_blocks: vec![],
         }
     }
 
@@ -209,6 +224,7 @@ impl<'ast> Resolver<'ast> {
         let errors = self.diagnostics.error_count();
         self.register_crate(self.entry);
         self.register_imports();
+        self.register_pending_on_blocks();
         if errors != self.diagnostics.error_count() {
             return Err(ResolutionError::RegError);
         }
@@ -240,8 +256,10 @@ impl<'ast> Resolver<'ast> {
             return;
         };
 
+        // the scope may be a container without a file (see `ScopeKind::Assoc`), so the
+        // diagnostic points into the file of the new definition
         let prev = self.out.nrt.table[prev];
-        let source = self.out.arena.lookup_root(scope);
+        let source = self.out.nrt.table[id].source();
         self.diagnostics.push(
             Diagnostic::error(
                 name.span,
@@ -260,15 +278,24 @@ impl<'ast> Resolver<'ast> {
         name: Spanned<Intern<str>>,
         kind: SymbolKind,
     ) -> NameResId {
-        let source = self.out.arena.lookup_root(scope);
-        let id = self
-            .out
-            .nrt
-            .table
-            .push(SymbolInfo::new(kind, name.span, source));
-
+        let id = self.declare(scope, name, kind);
         self.insert_name(scope, kind.namespace(), name, id);
         id
+    }
+
+    /// Create a symbol that was written in the given (lexical) scope, without making it
+    /// accessible through any scope. See [`Self::insert_name`].
+    fn declare(
+        &mut self,
+        scope: ScopeId,
+        name: Spanned<Intern<str>>,
+        kind: SymbolKind,
+    ) -> NameResId {
+        let source = self.out.arena.lookup_root(scope);
+        self.out
+            .nrt
+            .table
+            .push(SymbolInfo::new(kind, name.span, source))
     }
 
     /// Define a local variable. Unlike [`Self::define`], this allows shadowing.
@@ -324,7 +351,7 @@ impl Resolver<'_> {
             Item::FnDef(fndef) => self.register_fn_def(item.map(|_| fndef), scope),
             // we don't know whether the thing we're importing goes into the type or value
             // namespace yet. imports are registered once all items are known.
-            Item::Import(imp) => self.imports.push(PendingImport {
+            Item::Import(imp) => self.pending_imports.push(PendingImport {
                 path: imp.path().clone(),
                 scope,
                 node: item.id(),
@@ -339,6 +366,9 @@ impl Resolver<'_> {
             Item::Include(include) => self.register_include(item.map(|_| include), scope),
             Item::IncludeCrate(include) => {
                 self.register_include_crate(item.map(|_| include), scope)
+            }
+            Item::OnBlock(on_block) => {
+                self.register_on_block(item.map(|_| on_block), scope);
             }
         }
     }
@@ -364,7 +394,7 @@ impl Resolver<'_> {
                 *generic,
                 SymbolKind::Type {
                     generics: 0,
-                    subscope: None,
+                    assoc: None,
                 },
             );
         }
@@ -372,7 +402,11 @@ impl Resolver<'_> {
 
     fn register_fn_def(&mut self, fndef: Node<&FnDef>, scope: ScopeId) {
         self.define(scope, fndef.ident, SymbolKind::Function(fndef.args.len()));
+        self.register_fn_scope(fndef, scope);
+    }
 
+    /// Register the generics, arguments and body of a function written in `scope`.
+    fn register_fn_scope(&mut self, fndef: Node<&FnDef>, scope: ScopeId) {
         let subscope = self
             .out
             .arena
@@ -412,17 +446,55 @@ impl Resolver<'_> {
             .out
             .arena
             .create_scope(Some(scope), ScopeKind::Item, None);
+        // a container, not a lexical scope: no parent
+        let assoc = self.out.arena.create_scope(None, ScopeKind::Assoc, None);
         self.define(
             scope,
             ident,
             SymbolKind::Type {
                 generics: generics.map(|x| x.len()).unwrap_or_default(),
-                subscope: Some(subscope),
+                assoc: Some(assoc),
             },
         );
         self.out.subscopes.table.insert(node, subscope);
 
         self.register_generics(generics, subscope);
+    }
+
+    /// Register an `on` block. The items are declared with the block as their lexical scope,
+    /// but they are only made accessible through their type once all types are known. See
+    /// [`Self::register_pending_on_blocks`].
+    fn register_on_block(&mut self, block: Node<&OnBlock>, scope: ScopeId) {
+        let subscope = self
+            .out
+            .arena
+            .create_scope(Some(scope), ScopeKind::Item, None);
+        self.out.subscopes.table.insert(block.id(), subscope);
+        self.register_generics(block.generics.as_ref(), subscope);
+
+        let mut items = vec![];
+        for item in &block.items {
+            let (ident, id) = match &item.item {
+                OnBlockItem::Const(def) => {
+                    let id = self.declare(subscope, def.ident, SymbolKind::Variable(false));
+                    self.register_expr(&def.value.item, subscope);
+                    (def.ident, id)
+                }
+                OnBlockItem::FnDef(def) => {
+                    let kind = SymbolKind::Function(def.args.len());
+                    let id = self.declare(subscope, def.ident, kind);
+                    self.register_fn_scope(item.as_ref().map(|_| def), subscope);
+                    (def.ident, id)
+                }
+            };
+            items.push((ident, id));
+        }
+
+        self.pending_on_blocks.push(PendingOnBlock {
+            ty: block.ty.path.spanned.clone(),
+            scope: subscope,
+            items,
+        });
     }
 
     fn register_block(&mut self, block: Node<&Block>, scope: ScopeId, subscope: Option<ScopeId>) {
@@ -526,12 +598,17 @@ impl Resolver<'_> {
         self.define(scope, include.ident, SymbolKind::Module(root));
         self.out.subscopes.table.insert(include.id(), root);
     }
+}
 
+/////////////////////////////////////////////////////
+// INTER-STAGE // REGISTER DEPENDENT OBJECTS       //
+/////////////////////////////////////////////////////
+impl Resolver<'_> {
     /// Resolve and register all imports.
     ///
     /// Imports may refer to other imports, so this is repeated until no more progress is made.
     fn register_imports(&mut self) {
-        let mut pending = std::mem::take(&mut self.imports);
+        let mut pending = std::mem::take(&mut self.pending_imports);
 
         loop {
             let before = pending.len();
@@ -570,6 +647,46 @@ impl Resolver<'_> {
             pending = failed;
         }
     }
+
+    /// Make the items of every `on` block accessible through the type it is implemented on.
+    ///
+    /// This runs after the imports, as the type may be imported.
+    fn register_pending_on_blocks(&mut self) {
+        for block in std::mem::take(&mut self.pending_on_blocks) {
+            let assoc = match self.resolve_path(&block.ty, block.scope) {
+                Ok(Res::Def(id)) => match self.out.nrt.table[id].kind() {
+                    SymbolKind::Type {
+                        assoc: Some(assoc), ..
+                    } => *assoc,
+                    _ => {
+                        let source = self.out.arena.lookup_root(block.scope);
+                        let name = &block.ty.item.segments.last().unwrap().item;
+                        self.diagnostics.push(Diagnostic::error(
+                            block.ty.span,
+                            format!("`{}` is not a type that can have items", &**name),
+                            None,
+                            source,
+                        ));
+                        continue;
+                    }
+                },
+                Ok(Res::PrimTy(prim)) => {
+                    *self.out.prim_assoc.entry(prim).or_insert_with(|| {
+                        self.out.arena.create_scope(None, ScopeKind::Assoc, None)
+                    })
+                }
+                Err(e) => {
+                    self.diagnostics.push(e);
+                    continue;
+                }
+            };
+
+            for (name, id) in block.items {
+                let ns = self.out.nrt.table[id].kind().namespace();
+                self.insert_name(assoc, ns, name, id);
+            }
+        }
+    }
 }
 
 /////////////////////////////////////////////////////
@@ -583,9 +700,13 @@ impl Resolver<'_> {
             .flatten()
     }
 
-    fn resolve_path(&self, path: &Path, scope: ScopeId) -> Result<Res, Diagnostic> {
+    fn resolve_path(&self, path: &Path, mut scope: ScopeId) -> Result<Res, Diagnostic> {
         if let Some(r) = Resolver::is_primitive(path) {
             return Ok(Res::PrimTy(r));
+        }
+
+        if path.is_fully_qualified {
+            scope = self.out.arena.crate_root(scope);
         }
 
         let arena = &self.out.arena;
@@ -596,7 +717,21 @@ impl Resolver<'_> {
         let mut prev = first;
 
         // the last resolved symbol, or the scope `crate`/`super` refers to
-        let mut last = if first.item == *CRATE {
+        let mut last = if let Ok(prim) = PrimTy::try_from(&first.item as &str) {
+            // multi-segment paths only, single primitives are handled above
+            match self.out.prim_assoc.get(&prim) {
+                Some(&assoc) => Err(assoc),
+                None => {
+                    return Err(error(
+                        path.segments[1].span,
+                        format!(
+                            "`{}` does not exist in `{}`",
+                            &*path.segments[1].item, &*first.item
+                        ),
+                    ));
+                }
+            }
+        } else if first.item == *CRATE {
             Err(arena.crate_root(scope))
         } else if first.item == *SUPER {
             match arena.parent_module(arena.nearest_module(scope)) {
@@ -697,6 +832,7 @@ impl Resolver<'_> {
                     self.resolve_crate(id);
                 }
             }
+            Item::OnBlock(block) => self.resolve_on_block(item.map(|_| block)),
         }
     }
 
@@ -797,6 +933,26 @@ impl Resolver<'_> {
 
         if let Some(tail) = &block.tail {
             self.resolve_expr(tail, subscope);
+        }
+    }
+
+    fn resolve_on_block(&mut self, block: Node<&OnBlock>) {
+        let subscope = self.subscope(block.id());
+
+        // the type's path was already resolved when attaching the items, but its generics weren't
+        self.resolve_ty(&block.ty, subscope);
+        if let Some(protocol) = &block.protocol {
+            self.resolve_ty(protocol, subscope);
+        }
+
+        for item in &block.items {
+            match &item.item {
+                OnBlockItem::Const(def) => {
+                    self.resolve_ty(&def.ty, subscope);
+                    self.resolve_expr(&def.value, subscope);
+                }
+                OnBlockItem::FnDef(def) => self.resolve_fn_def(item.as_ref().map(|_| def)),
+            }
         }
     }
 }

@@ -57,7 +57,8 @@ keywords! {
     MODULE = "module",
     INCLUDE = "include",
     SUPER = "super",
-    CRATE = "crate"
+    CRATE = "crate",
+    ON = "on"
 }
 
 /// Check whether the given symbol is a keyword.
@@ -270,8 +271,9 @@ pub enum ParseError {
     ExpectedKw(Intern<str>, Span),
     /// A keyword was used where an identifier was expected.
     KwAsIdent(Intern<str>, Span),
-    /// Expected an item at that location.
-    ExpectedItem(Span),
+    /// Expected an item at that location. The flag is set if the item was expected inside an
+    /// `on` block, where only functions and constants are allowed.
+    ExpectedItem(Span, bool),
     /// An error was produced by the lexer/tokenizer.
     LexError(LexError),
     /// The entire input was not consumed fully.
@@ -295,11 +297,15 @@ impl ParseError {
                 span,
                 format!("expected an identifier, found keyword `{kw}`"),
             ),
-            Self::ExpectedItem(span) => (
+            Self::ExpectedItem(span, is_on_block) => (
                 span,
-                "expected an item (`func`, `product`, `sum`, `module`, `const`, `static`, \
-                 `import` or `include`)"
-                    .to_owned(),
+                if *is_on_block {
+                    "expected an item (`func` or `const`)".to_owned()
+                } else {
+                    "expected an item (`func`, `product`, `sum`, `module`, `const`, `static`, \
+                     `import`, `include` or `on`)"
+                        .to_owned()
+                },
             ),
             Self::TokenMismatch(tokens, span) => (span, format!("expected {}", describe(tokens))),
             Self::Eof(tokens, span) if tokens.is_empty() => {
