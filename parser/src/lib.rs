@@ -58,7 +58,8 @@ keywords! {
     INCLUDE = "include",
     SUPER = "super",
     CRATE = "crate",
-    ON = "on"
+    ON = "on",
+    NEW = "new"
 }
 
 /// Check whether the given symbol is a keyword.

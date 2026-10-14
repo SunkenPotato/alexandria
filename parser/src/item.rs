@@ -289,20 +289,20 @@ impl Parse for ProductDef {
 
 /// A field.
 #[derive(PartialEq, Debug, Clone)]
-pub struct Field {
+pub struct Field<T = Type> {
     /// The identifier.
     pub ident: Spanned<Intern<str>>,
-    /// The type.
-    pub ty: Spanned<Type>,
+    /// The value.
+    pub value: Spanned<T>,
 }
 
-impl Parse for Field {
+impl<T: Parse> Parse for Field<T> {
     fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
         let ident = guard.expect_ident()?;
         guard.next_require(TokenKind::Colon)?;
-        let ty = guard.spanning(Type::parse)?;
+        let ty = guard.spanning(T::parse)?;
 
-        Ok(Self { ident, ty })
+        Ok(Self { ident, value: ty })
     }
 }
 
@@ -666,7 +666,7 @@ mod tests {
                     fields: vec![
                         Field {
                             ident: Spanned::new(Span::new(21, 24), Intern::from("ptr")),
-                            ty: Spanned::new(
+                            value: Spanned::new(
                                 Span::new(26, 32),
                                 Type {
                                     path: Path::single(Spanned::new(
@@ -693,7 +693,7 @@ mod tests {
                         },
                         Field {
                             ident: Spanned::new(Span::new(34, 37), Intern::from("len")),
-                            ty: Spanned::new(
+                            value: Spanned::new(
                                 Span::new(39, 44),
                                 Type {
                                     path: Path::single(Spanned::new(
@@ -732,7 +732,7 @@ mod tests {
                     fields: vec![
                         Field {
                             ident: Spanned::new(Span::new(19, 21), Intern::from("Ok")),
-                            ty: Spanned::new(
+                            value: Spanned::new(
                                 Span::new(23, 24),
                                 Type {
                                     path: Path::single(Spanned::new(
@@ -746,7 +746,7 @@ mod tests {
                         },
                         Field {
                             ident: Spanned::new(Span::new(26, 29), Intern::from("Err")),
-                            ty: Spanned::new(
+                            value: Spanned::new(
                                 Span::new(31, 32),
                                 Type {
                                     path: Path::single(Spanned::new(
@@ -782,7 +782,7 @@ mod tests {
                     args: vec![
                         Field {
                             ident: Spanned::new(Span::new(18, 21), Intern::from("rhs")),
-                            ty: Spanned::new(
+                            value: Spanned::new(
                                 Span::new(23, 24),
                                 Type {
                                     path: Path::single(Spanned::new(
@@ -796,7 +796,7 @@ mod tests {
                         },
                         Field {
                             ident: Spanned::new(Span::new(26, 29), Intern::from("lhs")),
-                            ty: Spanned::new(
+                            value: Spanned::new(
                                 Span::new(31, 32),
                                 Type {
                                     path: Path::single(Spanned::new(

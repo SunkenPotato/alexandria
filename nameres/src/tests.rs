@@ -144,7 +144,7 @@ fn collect_item<'a>(item: &'a Node<Item>, out: &mut Vec<&'a Node<Path>>) {
         Item::Module(module) => collect_items(&module.module.items, out),
         Item::ProductDef(ProductDef { fields, .. }) | Item::SumDef(SumDef { fields, .. }) => {
             for field in fields {
-                collect_ty(&field.ty, out);
+                collect_ty(&field.value, out);
             }
         }
         Item::OnBlock(block) => {
@@ -170,7 +170,7 @@ fn collect_item<'a>(item: &'a Node<Item>, out: &mut Vec<&'a Node<Path>>) {
 
 fn collect_fn_def<'a>(def: &'a FnDef, out: &mut Vec<&'a Node<Path>>) {
     for arg in &def.args {
-        collect_ty(&arg.ty, out);
+        collect_ty(&arg.value, out);
     }
     if let Some(ret) = &def.ret_ty {
         collect_ty(ret, out);
@@ -238,6 +238,11 @@ fn collect_base_expr<'a>(expr: &'a BaseExpr, out: &mut Vec<&'a Node<Path>>) {
             collect_base_expr(&fcall.object, out);
             for arg in &fcall.args {
                 collect_expr(arg, out);
+            }
+        }
+        BaseExpr::Construct(construct) => {
+            for field in &construct.fields {
+                collect_expr(&field.value, out);
             }
         }
         BaseExpr::Parenthesized(paren) => collect_expr(paren, out),

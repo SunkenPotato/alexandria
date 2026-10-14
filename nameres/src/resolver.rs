@@ -564,6 +564,11 @@ impl Resolver<'_> {
                     self.register_expr(&arg.item, scope);
                 }
             }
+            BaseExpr::Construct(construct) => {
+                for field in &construct.fields {
+                    self.register_expr(&field.value, scope);
+                }
+            }
             BaseExpr::Parenthesized(paren) => self.register_expr(paren, scope),
             BaseExpr::Literal(_)
             | BaseExpr::Path(_)
@@ -819,7 +824,7 @@ impl Resolver<'_> {
             Item::ProductDef(ProductDef { fields, .. }) | Item::SumDef(SumDef { fields, .. }) => {
                 let subscope = self.subscope(item.id());
                 for field in fields {
-                    self.resolve_ty(&field.ty, subscope);
+                    self.resolve_ty(&field.value, subscope);
                 }
             }
             Item::Include(_) => {
@@ -840,7 +845,7 @@ impl Resolver<'_> {
         let subscope = self.subscope(fn_def.id());
 
         for field in &fn_def.args {
-            self.resolve_ty(&field.ty, subscope);
+            self.resolve_ty(&field.value, subscope);
         }
 
         if let Some(ret) = &fn_def.ret_ty {
@@ -899,6 +904,15 @@ impl Resolver<'_> {
                 self.resolve_base_expr(&fcall.object, scope);
                 for arg in &fcall.args {
                     self.resolve_expr(arg, scope);
+                }
+            }
+            BaseExpr::Construct(construct) => {
+                if let Err(e) = self.resolve_path(&construct.path, scope) {
+                    self.diagnostics.push(e);
+                }
+
+                for field in &construct.fields {
+                    self.resolve_expr(&field.value, scope);
                 }
             }
             BaseExpr::Parenthesized(paren) => self.resolve_expr(paren, scope),

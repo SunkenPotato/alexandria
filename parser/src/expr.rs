@@ -5,8 +5,11 @@ use node::Node;
 use span::{Span, Spanned};
 
 use crate::{
-    BREAK, CONTINUE, DECL, ELSE, IF, LOOP, Parse, ParseError, ParseGuard, ParseResult, RETURN,
-    expr::literal::Literal, item::Item, path::Path, stmt::Stmt,
+    BREAK, CONTINUE, DECL, ELSE, IF, LOOP, NEW, Parse, ParseError, ParseGuard, ParseResult, RETURN,
+    expr::literal::Literal,
+    item::{Field, Item},
+    path::Path,
+    stmt::Stmt,
 };
 
 /// An expression.
@@ -268,6 +271,8 @@ pub enum BaseExpr {
     Break(Option<Box<Spanned<Expr>>>),
     /// A return expression.
     Return(Option<Box<Spanned<Expr>>>),
+    /// A construction expression.
+    Construct(ConstructionExpr),
 }
 
 impl Parse for BaseExpr {
@@ -319,6 +324,8 @@ impl BaseExpr {
                     guard.with(parse_kw_with_expr(*BREAK, Self::Break))
                 } else if symbol == *RETURN {
                     guard.with(parse_kw_with_expr(*RETURN, Self::Return))
+                } else if symbol == *NEW {
+                    guard.with(ConstructionExpr::parse).map(Self::Construct)
                 } else {
                     guard
                         .spanning(Path::parse)
@@ -759,6 +766,24 @@ pub struct FieldAccess {
     pub ident: Spanned<Intern<str>>,
 }
 
+/// A construction expression.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstructionExpr {
+    /// The path of the item being constructed.
+    pub path: Spanned<Path>,
+    /// The field being constructed.
+    pub fields: Vec<Spanned<Field<Expr>>>,
+}
+
+impl Parse for ConstructionExpr {
+    fn parse<'source, 'index>(mut guard: ParseGuard<'source, 'index>) -> ParseResult<Self> {
+        guard.expect_kw(*NEW)?;
+        let path = guard.spanning(Path::parse)?;
+        let fields = guard.parse_delimited(TokenKind::LCurly, TokenKind::RCurly, Field::parse)?;
+        Ok(Self { path, fields })
+    }
+}
+
 // --- tests ---
 #[cfg(test)]
 mod tests {
@@ -770,7 +795,7 @@ mod tests {
         assert_eq,
         expr::{
             Assignment, BaseExpr, BinaryExpr, BinaryOp, Block, ConditionalBlock, ConditionalExpr,
-            Expr, FnCall,
+            ConstructionExpr, Expr, FnCall,
             literal::{IntegerLiteral, Literal, StringLiteral},
         },
         item::Type,
@@ -1354,6 +1379,31 @@ mod tests {
                 }),
             ),
         );
+    }
+
+    #[test]
+    fn parse_construction_expr() {
+        assert_eq(
+            "new Resource { a: 0 }",
+            Spanned::new(
+                Span::new(0, 21),
+                Expr::Base(BaseExpr::Construct(ConstructionExpr {
+                    path: Path::single(Spanned::new(Span::new(4, 12), Intern::from("Resource"))),
+                    fields: vec![Spanned::new(
+                        Span::new(15, 19),
+                        crate::item::Field {
+                            ident: Spanned::new(Span::new(15, 16), Intern::from("a")),
+                            value: Spanned::new(
+                                Span::new(18, 19),
+                                Expr::Base(BaseExpr::Literal(Literal::Int(IntegerLiteral::Ok(
+                                    0, None,
+                                )))),
+                            ),
+                        },
+                    )],
+                })),
+            ),
+        )
     }
 }
 
